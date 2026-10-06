@@ -12,6 +12,7 @@ import type {
   TransferAuthorization,
   UnilateralExitResponse,
 } from "@breeztech/breez-sdk-spark/web";
+import { appBreezKey } from "./app-key";
 
 type SdkModule = typeof import("@breeztech/breez-sdk-spark/web");
 
@@ -126,6 +127,24 @@ export async function connectLive(input: {
   builder = await builder.withDefaultStorage(`cpay-${input.network}-a${input.account}`);
   await adopt(await builder.build());
   return liveInfo(true);
+}
+
+let opening: Promise<boolean> | null = null;
+
+export async function ensureLive(mnemonic: string) {
+  const key = appBreezKey();
+  const phrase = mnemonic.trim();
+  if (!key || !phrase) return false;
+  if (isLiveConnected()) return true;
+  if (!opening) {
+    opening = connectLive({ mnemonic: phrase, apiKey: key, network: "mainnet", account: 0 })
+      .then(() => true)
+      .catch(() => false)
+      .finally(() => {
+        opening = null;
+      });
+  }
+  return opening;
 }
 
 export async function disconnectLive() {

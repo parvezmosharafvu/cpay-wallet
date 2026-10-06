@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { generateMnemonic, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 import { ArrowLeft } from "lucide-react";
+import { appBreezKey } from "@/lib/cpay/app-key";
 import { sdkText, type SdkCopy } from "@/lib/cpay/sdk-copy";
 import {
   addSdkContact,
@@ -101,7 +102,7 @@ type Section = (typeof SECTIONS)[number];
 
 export function SdkScreen({ close }: { close: () => void }) {
   const lang = useCpay((s) => s.lang);
-  const apiKey = useCpay((s) => s.apiKey);
+  const apiKey = appBreezKey();
   const mnemonic = useCpay((s) => s.sdkMnemonic);
   const network = useCpay((s) => s.sdkNetwork);
   const account = useCpay((s) => s.sdkAccount);

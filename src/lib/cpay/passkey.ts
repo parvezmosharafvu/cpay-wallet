@@ -1,4 +1,5 @@
 import type { Seed } from "@breeztech/breez-sdk-spark/web";
+import { appBreezKey } from "./app-key";
 
 function relyingParty(): string {
   if (typeof window === "undefined") return "localhost";
@@ -13,11 +14,12 @@ function wordsFromSeed(seed: Seed): string[] {
   return words;
 }
 
-async function client(apiKey: string) {
+async function client() {
   const web = await import("@breeztech/breez-sdk-spark/web");
   await web.default();
   const { PasskeyClient } = await import("@breeztech/breez-sdk-spark/passkey-prf-provider");
-  return new PasskeyClient(apiKey.trim() || undefined, {
+  const apiKey = appBreezKey();
+  return new PasskeyClient(apiKey || undefined, {
     defaultLabel: "CPay",
     providerOptions: {
       rpId: relyingParty(),
@@ -28,8 +30,8 @@ async function client(apiKey: string) {
   });
 }
 
-export async function createPasskey(apiKey: string, label: string): Promise<string[]> {
-  const passkey = await client(apiKey);
+export async function createPasskey(label: string): Promise<string[]> {
+  const passkey = await client();
   const availability = await passkey.checkAvailability();
   if (availability.type === "notAssociated") {
     throw new Error(availability.reason);
@@ -51,8 +53,8 @@ export async function createPasskey(apiKey: string, label: string): Promise<stri
   }
 }
 
-export async function signInPasskey(apiKey: string, label: string): Promise<string[]> {
-  const passkey = await client(apiKey);
+export async function signInPasskey(label: string): Promise<string[]> {
+  const passkey = await client();
   const signed = await passkey.signIn({ label: label.trim() || "CPay" });
   return wordsFromSeed(signed.wallet.seed);
 }

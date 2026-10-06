@@ -40,7 +40,8 @@ import type { Lang, PayKind, Payment } from "@/lib/cpay/types";
 import { createPasskey, passkeyMessage, signInPasskey } from "@/lib/cpay/passkey";
 import { Capacitor } from "@capacitor/core";
 import { startAds } from "@/lib/cpay/ads";
-import { explain, isLiveConnected, liveInfo, prepareLiveSend, receiveLive, sendLive } from "@/lib/cpay/sdk";
+import { appBreezKey } from "@/lib/cpay/app-key";
+import { explain, ensureLive, isLiveConnected, liveInfo, prepareLiveSend, receiveLive, sendLive } from "@/lib/cpay/sdk";
 import { SdkScreen } from "@/components/cpay/sdk-screen";
 
 type Tab = "home" | "send" | "receive" | "activity" | "more";
@@ -292,9 +293,8 @@ function Onboarding() {
     setBusy(true);
     setErr(null);
     try {
-      const apiKey = useCpay.getState().apiKey;
       const label = name.trim() || "CPay";
-      const seed = kind === "create" ? await createPasskey(apiKey, label) : await signInPasskey(apiKey, label);
+      const seed = kind === "create" ? await createPasskey(label) : await signInPasskey(label);
       setSdkMnemonic(seed.join(" "));
       const result = await createMember(label, { seed, backup: false });
       if (!result.ok) setErr(t(lang, result.error));
@@ -506,11 +506,20 @@ function HomeScreen({
   const [msg, setMsg] = useState<string | null>(null);
   const [liveSats, setLiveSats] = useState<number | null>(null);
   useEffect(() => {
-    if (!isLiveConnected()) return;
-    void liveInfo()
-      .then((info) => setLiveSats(info.balanceSats))
-      .catch(() => setLiveSats(null));
-  }, []);
+    const phrase = me?.seed.join(" ") ?? "";
+    if (!phrase) return;
+    let stop = false;
+    void ensureLive(phrase)
+      .then(async (ok) => {
+        if (!ok || stop) return;
+        const info = await liveInfo();
+        if (!stop) setLiveSats(info.balanceSats);
+      })
+      .catch(() => undefined);
+    return () => {
+      stop = true;
+    };
+  }, [me?.id, me?.seed]);
   if (!me) return null;
   const total = satsToUsd(me.sats, btcUsd) + me.usdbCents / 100;
   const recent = payments.filter((p) => p.memberId === me.id).slice(0, 4);
@@ -538,7 +547,7 @@ function HomeScreen({
 
       <section className="mt-5 rounded-3xl border border-line bg-surface p-4">
         <div className="flex items-center justify-between">
-          <p className="text-xs font-medium uppercase tracking-wide text-primary">{t(lang, "practice")}</p>
+          <p className="text-xs font-medium uppercase tracking-wide text-primary">{liveSats != null ? t(lang, "liveBal") : t(lang, "practice")}</p>
           <div className="flex rounded-full border border-line p-1 text-xs">
             <button
               type="button"
@@ -557,16 +566,13 @@ function HomeScreen({
           </div>
         </div>
         <p className="mt-3 font-mono text-4xl font-medium tabular-nums tracking-tight">
-          {mode === "usd" ? formatUsd(total) : formatSats(me.sats)}
+          {mode === "usd" ? formatUsd(liveSats != null ? satsToUsd(liveSats, btcUsd) : total) : formatSats(liveSats ?? me.sats)}
         </p>
         <p className="mt-1 text-sm text-muted">
           {mode === "usd"
-            ? `${formatSats(me.sats)} sats`
-            : formatUsd(satsToUsd(me.sats, btcUsd))}
+            ? `${formatSats(liveSats ?? me.sats)} sats`
+            : formatUsd(satsToUsd(liveSats ?? me.sats, btcUsd))}
         </p>
-        {liveSats != null ? (
-          <p className="mt-2 text-sm text-primary">{t(lang, "liveBal")} · {formatSats(liveSats)} sats</p>
-        ) : null}
         <p className="mt-3 font-mono text-xs text-muted">
           {t(lang, "rateLabel")} {formatUsd(btcUsd)} · {priceLive ? t(lang, "liveRate") : t(lang, "practiceRate")}
         </p>
@@ -575,7 +581,7 @@ function HomeScreen({
       <div className="mt-3 grid grid-cols-2 gap-2">
         <div className="rounded-2xl border border-line bg-surface px-3 py-3">
           <p className="text-xs text-muted">{t(lang, "btcBal")}</p>
-          <p className="mt-1 font-mono text-sm tabular-nums">{formatSats(me.sats)} sats</p>
+          <p className="mt-1 font-mono text-sm tabular-nums">{formatSats(liveSats ?? me.sats)} sats</p>
         </div>
         <div className="rounded-2xl border border-line bg-surface px-3 py-3">
           <p className="text-xs text-muted">{t(lang, "stableBal")}</p>
@@ -622,6 +628,9 @@ function HomeScreen({
       {recent.length === 0 ? (
         <div className="mt-3 rounded-2xl border border-line bg-surface p-4">
           <p className="text-sm text-muted">{t(lang, "emptyHome")}</p>
+          {appBreezKey() ? (
+            <p className="mt-3 text-sm text-fg">{t(lang, "setKeyHelp")}</p>
+          ) : (
           <div className="mt-3 flex flex-col gap-2">
             <Btn
               onClick={() => {
@@ -637,6 +646,7 @@ function HomeScreen({
               </Btn>
             ) : null}
           </div>
+          )}
         </div>
       ) : (
         <ul className="mt-2">
@@ -758,7 +768,8 @@ function SendScreen({ openDetail }: { openDetail: (id: string) => void }) {
   }
 
   async function pay() {
-    if (isLiveConnected() && !localId && !stable) {
+    const live = await ensureLive(me!.seed.join(" "));
+    if (live && !localId && !stable) {
       setBusy(true);
       setErr(null);
       try {
@@ -1014,7 +1025,8 @@ function ReceiveScreen({ ping }: { ping: (msg: string) => void }) {
   ];
 
   async function make() {
-    if (isLiveConnected() && method !== "usd") {
+    const live = await ensureLive(me!.seed.join(" "));
+    if (live && method !== "usd") {
       try {
         const res = await receiveLive({
           method: method === "ln" ? "bolt11" : method === "spark" ? "spark" : "bitcoin",
@@ -1230,7 +1242,6 @@ function MoreScreen({ open }: { open: (page: Page) => void }) {
 function CashScreen({ close, ping }: { close: () => void; ping: (m: string) => void }) {
   const lang = useCpay((s) => s.lang);
   const members = useCpay((s) => s.members);
-  const apiKey = useCpay((s) => s.apiKey);
   const recordCash = useCpay((s) => s.recordCash);
   const [addr, setAddr] = useState("");
   const [usd, setUsd] = useState("10");
@@ -1287,7 +1298,7 @@ function CashScreen({ close, ping }: { close: () => void; ping: (m: string) => v
             <Line k={t(lang, "viaL")} v={`${picked.provider} · ${picked.chain}`} />
             <p className="pt-2 text-sm text-primary">{t(lang, "noteL")}</p>
             <p className="break-all pt-2 font-mono text-xs text-muted">{link}</p>
-            <p className="pt-2 text-xs text-muted">{apiKey ? t(lang, "realKey") : t(lang, "noApi")}</p>
+            <p className="pt-2 text-xs text-muted">{appBreezKey() ? t(lang, "setKeyHelp") : t(lang, "noApi")}</p>
             <div className="mt-3 flex flex-col gap-2">
               <Btn
                 tone="ghost"
@@ -1721,21 +1732,17 @@ function MembersScreen({ close, ping }: { close: () => void; ping: (m: string) =
 
 function SettingsScreen({ close, ping }: { close: () => void; ping: (m: string) => void }) {
   const lang = useCpay((s) => s.lang);
-  const apiKey = useCpay((s) => s.apiKey);
   const admobAppId = useCpay((s) => s.admobAppId);
   const admobUnitId = useCpay((s) => s.admobUnitId);
   const showAds = useCpay((s) => s.showAds);
   const setLang = useCpay((s) => s.setLang);
-  const setApiKey = useCpay((s) => s.setApiKey);
   const setAdIds = useCpay((s) => s.setAdIds);
   const setShowAds = useCpay((s) => s.setShowAds);
   const faucet = useCpay((s) => s.faucet);
   const wipe = useCpay((s) => s.wipe);
   const setPrice = useCpay((s) => s.setPrice);
-  const [key, setKey] = useState(apiKey);
   const [appId, setAppId] = useState(admobAppId);
   const [unit, setUnit] = useState(admobUnitId);
-  const [showKey, setShowKey] = useState(false);
   const [askWipe, setAskWipe] = useState(false);
   const [priceMsg, setPriceMsg] = useState<string | null>(null);
 
@@ -1762,29 +1769,6 @@ function SettingsScreen({ close, ping }: { close: () => void; ping: (m: string) 
       <section className="mt-5">
         <h2 className="text-base font-semibold">{t(lang, "apiSection")}</h2>
         <p className="mt-1 text-sm text-muted">{t(lang, "setKeyHelp")}</p>
-        <label className="mt-3 block">
-          <span className="mb-2 block text-sm text-muted">{t(lang, "apiKey")}</span>
-          <input
-            value={key}
-            onChange={(e) => setKey(e.target.value)}
-            type={showKey ? "text" : "password"}
-            autoComplete="off"
-            placeholder={t(lang, "breezPh")}
-            className="h-12 w-full rounded-2xl border border-line bg-surface px-4 font-mono text-base text-fg outline-none focus:border-primary"
-          />
-        </label>
-        <div className="mt-2 flex gap-3">
-          <button type="button" className="text-sm text-primary" onClick={() => setShowKey((v) => !v)}>
-            {showKey ? t(lang, "hide") : t(lang, "show")}
-          </button>
-          <button type="button" className="text-sm text-muted" onClick={() => { setKey(""); setApiKey(""); ping(t(lang, "keyCleared")); }}>
-            {t(lang, "clear")}
-          </button>
-        </div>
-        <div className="mt-3">
-          <Btn onClick={() => { setApiKey(key); ping(t(lang, "keySaved")); }}>{t(lang, "saveKey")}</Btn>
-        </div>
-        <p className="mt-2 text-xs text-muted">{t(lang, "sdkLine")}</p>
       </section>
       <section className="mt-6">
         <h2 className="text-base font-semibold">{t(lang, "adsSection")}</h2>
@@ -1807,7 +1791,9 @@ function SettingsScreen({ close, ping }: { close: () => void; ping: (m: string) 
         <h2 className="text-base font-semibold">{t(lang, "toolsH")}</h2>
         <p className="mt-1 text-sm text-muted">{t(lang, "toolsLead")}</p>
         <div className="mt-3 flex flex-col gap-2">
-          <Btn tone="ghost" onClick={() => { faucet(); ping(t(lang, "fundsAdded")); }}>{t(lang, "addB2")}</Btn>
+          {appBreezKey() ? null : (
+            <Btn tone="ghost" onClick={() => { faucet(); ping(t(lang, "fundsAdded")); }}>{t(lang, "addB2")}</Btn>
+          )}
           <Btn tone="ghost" onClick={() => { void refreshPrice(); }}>{t(lang, "tryPrice")}</Btn>
           {priceMsg ? <p className="text-sm text-muted">{priceMsg}</p> : null}
         </div>
