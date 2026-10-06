@@ -88,7 +88,7 @@
     "zustand": "^5.0.0"
   },
   "devDependencies": {
-    "@capacitor/cli": "^6.2.2",
+    "@capacitor/cli": "^8.5.2",
     "@eslint/js": "^9.20.0",
     "@types/node": "^22.16.5",
     "@types/pg": "^8.11.10",
