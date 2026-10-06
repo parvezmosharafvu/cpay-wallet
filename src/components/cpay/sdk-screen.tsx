@@ -15,10 +15,14 @@ import {
   conversionLimits,
   importExit,
   prepareBatchLive,
+  publishLnurlLive,
+  publishTransferLive,
   sendBatchLive,
   walletSnapshot,
   watchLive,
+  buildUnsignedBatchLive,
   buildUnsignedLive,
+  buildUnsignedLnurlLive,
   burnTokenLive,
   buyLive,
   checkAddress,
@@ -35,6 +39,7 @@ import {
   fiatCurrencies,
   fiatRates,
   freezeTokenLive,
+  getLivePayment,
   isLiveConnected,
   issuerState,
   listDeposits,
@@ -741,6 +746,8 @@ function AdvancedPane({ t, busy, onRun }: Pane) {
   const [secret, setSecret] = useState("");
   const [preimage, setPreimage] = useState("");
   const [tokenId, setTokenId] = useState("");
+  const [paymentId, setPaymentId] = useState("");
+  const [signed, setSigned] = useState("");
   const [blob, setBlob] = useState("");
   return (
     <>
@@ -772,6 +779,17 @@ function AdvancedPane({ t, busy, onRun }: Pane) {
         {t("broadcast")}
       </Btn>
       <Btn ghost disabled={busy} onClick={() => void onRun(checkExit)}>{t("checkExit")}</Btn>
+      <Field label={t("paymentLookup")} value={paymentId} onChange={setPaymentId} mono />
+      <Btn ghost disabled={busy} onClick={() => void onRun(() => getLivePayment(paymentId))}>{t("paymentLookup")}</Btn>
+      <Row>
+        <Btn ghost disabled={busy} onClick={() => void onRun(buildUnsignedBatchLive)}>{t("unsignedBatch")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(buildUnsignedLnurlLive)}>{t("unsignedLnurl")}</Btn>
+      </Row>
+      <Field label={t("publish")} value={signed} onChange={setSigned} mono />
+      <Row>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => publishTransferLive(signed))}>{t("publish")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => publishLnurlLive(signed))}>{t("publishLnurl")}</Btn>
+      </Row>
       <Field label={t("importExit")} value={blob} onChange={setBlob} mono />
       <Btn ghost disabled={busy} onClick={() => void onRun(() => importExit(blob))}>{t("importExit")}</Btn>
       <Field label={t("htlc")} value={preimage} onChange={setPreimage} mono />

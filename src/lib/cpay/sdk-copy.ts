@@ -115,6 +115,11 @@ const en = {
   balance: "Balance",
   keyMissing: "Save a Breez API key in Settings before mainnet.",
   badSeed: "That is not a 12 or 24 word seed.",
+  paymentLookup: "Open payment",
+  unsignedBatch: "Unsigned batch",
+  unsignedLnurl: "Unsigned LNURL",
+  publish: "Publish signed",
+  publishLnurl: "Publish LNURL",
 };
 
 const bn: Record<keyof typeof en, string> = {
@@ -232,6 +237,11 @@ const bn: Record<keyof typeof en, string> = {
   balance: "ব্যালেন্স",
   keyMissing: "Mainnet-এর আগে সেটিংসে Breez API key সেভ করুন।",
   badSeed: "এটা ১২ বা ২৪ শব্দের সিড না।",
+  paymentLookup: "পেমেন্ট খুলুন",
+  unsignedBatch: "আনসাইনড ব্যাচ",
+  unsignedLnurl: "আনসাইনড LNURL",
+  publish: "সাইন করা পাবলিশ",
+  publishLnurl: "LNURL পাবলিশ",
 };
 
 export type SdkCopy = keyof typeof en;

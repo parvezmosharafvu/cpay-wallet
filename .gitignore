@@ -10,3 +10,12 @@ dist/
 .env
 .env.*
 .DS_Store
+cpay-wallet.zip
+android/keystore.properties
+android/keystore/
+CPay-keystore.txt
+
+
+dist-mobile/
+*.apk
+*.keystore

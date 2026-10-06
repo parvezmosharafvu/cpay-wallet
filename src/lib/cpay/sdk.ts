@@ -182,6 +182,28 @@ export async function prepareLiveSend(input: {
   return prepared;
 }
 
+export async function getLivePayment(paymentId: string) {
+  return need().getPayment({ paymentId: paymentId.trim() });
+}
+
+export async function buildUnsignedBatchLive() {
+  if (!preparedBatch) throw new Error("Prepare the batch first.");
+  return need().buildUnsignedBatchPackage({ prepareResponse: preparedBatch });
+}
+
+export async function buildUnsignedLnurlLive() {
+  if (!preparedLnurl) throw new Error("Prepare the LNURL payment first.");
+  return need().buildUnsignedLnurlPayPackage({ prepareResponse: preparedLnurl });
+}
+
+export async function publishTransferLive(raw: string) {
+  return need().publishSignedTransferPackage({ signedPackage: JSON.parse(raw) as never });
+}
+
+export async function publishLnurlLive(raw: string) {
+  return need().publishSignedLnurlPayPackage({ signedPackage: JSON.parse(raw) as never });
+}
+
 export async function sendLive(speed: OnchainConfirmationSpeed) {
   if (!prepared) throw new Error("Prepare the payment first.");
   const method = prepared.paymentMethod;

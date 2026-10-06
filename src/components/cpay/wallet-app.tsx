@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ArrowDownLeft,
   ArrowLeft,
@@ -37,7 +37,10 @@ import {
 import { parseInput, routesFor, type CashRoute, type Parsed } from "@/lib/cpay/parse";
 import { activeMember, useCpay } from "@/lib/cpay/store";
 import type { Lang, PayKind, Payment } from "@/lib/cpay/types";
-import { InstallCard } from "@/components/cpay/install-card";
+import { createPasskey, passkeyMessage, signInPasskey } from "@/lib/cpay/passkey";
+import { Capacitor } from "@capacitor/core";
+import { startAds } from "@/lib/cpay/ads";
+import { explain, isLiveConnected, liveInfo, prepareLiveSend, receiveLive, sendLive } from "@/lib/cpay/sdk";
 import { SdkScreen } from "@/components/cpay/sdk-screen";
 
 type Tab = "home" | "send" | "receive" | "activity" | "more";
@@ -223,7 +226,7 @@ function Dock({ tab, onTab }: { tab: Tab; onTab: (tab: Tab) => void }) {
   return (
     <div className="fixed inset-x-0 bottom-0 z-20">
       <div className="dock-safe mx-auto w-full max-w-md bg-bg">
-        {showAds ? <AdSlot /> : null}
+        {showAds && !Capacitor.isNativePlatform() ? <AdSlot /> : null}
         <nav className="grid grid-cols-5 border-t border-line" aria-label="Primary">
           {items.map((item) => {
             const Icon = item.icon;
@@ -247,6 +250,22 @@ function Dock({ tab, onTab }: { tab: Tab; onTab: (tab: Tab) => void }) {
   );
 }
 
+async function readQr(file: File) {
+  const bitmap = await createImageBitmap(file);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("scan");
+  ctx.drawImage(bitmap, 0, 0);
+  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const { default: jsQR } = await import("jsqr");
+  const code = jsQR(image.data, image.width, image.height);
+  bitmap.close();
+  if (!code?.data) throw new Error("scan");
+  return code.data;
+}
+
 function Splash() {
   return (
     <Frame>
@@ -262,11 +281,29 @@ function Onboarding() {
   const lang = useCpay((s) => s.lang);
   const setLang = useCpay((s) => s.setLang);
   const createMember = useCpay((s) => s.createMember);
+  const setSdkMnemonic = useCpay((s) => s.setSdkMnemonic);
   const [mode, setMode] = useState<"home" | "create" | "restore">("home");
   const [name, setName] = useState("");
   const [words, setWords] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  async function withPasskey(kind: "create" | "signin") {
+    setBusy(true);
+    setErr(null);
+    try {
+      const apiKey = useCpay.getState().apiKey;
+      const label = name.trim() || "CPay";
+      const seed = kind === "create" ? await createPasskey(apiKey, label) : await signInPasskey(apiKey, label);
+      setSdkMnemonic(seed.join(" "));
+      const result = await createMember(label, { seed, backup: false });
+      if (!result.ok) setErr(t(lang, result.error));
+    } catch (error) {
+      setErr(t(lang, passkeyMessage(error)));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function create() {
     setBusy(true);
@@ -319,9 +356,11 @@ function Onboarding() {
               </li>
             ))}
           </ul>
+          {err ? <p className="mt-4 text-sm text-danger">{err}</p> : null}
           <div className="mt-auto flex flex-col gap-3 pt-8">
-            <InstallCard compact />
-            <Btn onClick={() => { setErr(null); setMode("create"); }}>{t(lang, "createWallet")}</Btn>
+            <Btn disabled={busy} onClick={() => void withPasskey("create")}>{busy ? t(lang, "creating") : t(lang, "passkeyCta")}</Btn>
+            <Btn tone="ghost" disabled={busy} onClick={() => void withPasskey("signin")}>{t(lang, "passkeyIn")}</Btn>
+            <Btn tone="ghost" onClick={() => { setErr(null); setMode("create"); }}>{t(lang, "createWallet")}</Btn>
             <Btn tone="ghost" onClick={() => { setErr(null); setMode("restore"); }}>{t(lang, "restoreWallet")}</Btn>
           </div>
         </div>
@@ -465,6 +504,13 @@ function HomeScreen({
   const faucet = useCpay((s) => s.faucet);
   const [mode, setMode] = useState<"usd" | "btc">("usd");
   const [msg, setMsg] = useState<string | null>(null);
+  const [liveSats, setLiveSats] = useState<number | null>(null);
+  useEffect(() => {
+    if (!isLiveConnected()) return;
+    void liveInfo()
+      .then((info) => setLiveSats(info.balanceSats))
+      .catch(() => setLiveSats(null));
+  }, []);
   if (!me) return null;
   const total = satsToUsd(me.sats, btcUsd) + me.usdbCents / 100;
   const recent = payments.filter((p) => p.memberId === me.id).slice(0, 4);
@@ -518,6 +564,9 @@ function HomeScreen({
             ? `${formatSats(me.sats)} sats`
             : formatUsd(satsToUsd(me.sats, btcUsd))}
         </p>
+        {liveSats != null ? (
+          <p className="mt-2 text-sm text-primary">{t(lang, "liveBal")} · {formatSats(liveSats)} sats</p>
+        ) : null}
         <p className="mt-3 font-mono text-xs text-muted">
           {t(lang, "rateLabel")} {formatUsd(btcUsd)} · {priceLive ? t(lang, "liveRate") : t(lang, "practiceRate")}
         </p>
@@ -650,6 +699,8 @@ function SendScreen({ openDetail }: { openDetail: (id: string) => void }) {
   const [speed, setSpeed] = useState<Speed>("medium");
   const [err, setErr] = useState<string | null>(null);
   const [payId, setPayId] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const scanRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!prefill) return;
@@ -706,7 +757,22 @@ function SendScreen({ openDetail }: { openDetail: (id: string) => void }) {
     setStep(parsed.type === "bitcoin" && parsed.mainnetLike ? "warn" : "review");
   }
 
-  function pay() {
+  async function pay() {
+    if (isLiveConnected() && !localId && !stable) {
+      setBusy(true);
+      setErr(null);
+      try {
+        await prepareLiveSend({ destination: dest.trim(), amount: String(sats), tokenIdentifier: "" });
+        await sendLive(speed);
+        setPayId(null);
+        setStep("done");
+      } catch (error) {
+        setErr(explain(error));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     const result = stable
       ? sendStable({ destination: dest.trim(), cents: Math.round(Number(amount) * 100), note: "" })
       : sendBitcoin({
@@ -735,6 +801,23 @@ function SendScreen({ openDetail }: { openDetail: (id: string) => void }) {
       {step === "dest" ? (
         <div className="mt-5 flex flex-col gap-3">
           <Field label={t(lang, "destLabel")} value={dest} onChange={setDest} placeholder={t(lang, "destPh")} mono />
+          <input
+            ref={scanRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (!file) return;
+              void readQr(file).then((text) => {
+                setDest(text);
+                setErr(null);
+              }).catch(() => setErr(t(lang, "unknownDest")));
+            }}
+          />
+          <Btn tone="ghost" onClick={() => scanRef.current?.click()}>{t(lang, "scan")}</Btn>
           {parsed.type !== "empty" && parsed.type !== "unknown" ? (
             <p className="text-sm text-primary">
               {t(lang, "detected")}: {parsed.type}
@@ -844,7 +927,7 @@ function SendScreen({ openDetail }: { openDetail: (id: string) => void }) {
             {localId ? <p className="pt-2 text-sm text-primary">{t(lang, "sparkCheaper")}</p> : <p className="pt-2 text-sm text-muted">{t(lang, "broadcastNo")}</p>}
           </div>
           {err ? <p className="text-sm text-danger">{err}</p> : null}
-          <Btn onClick={pay}>{t(lang, "sendPay")}</Btn>
+          <Btn onClick={() => void pay()} disabled={busy}>{t(lang, "sendPay")}</Btn>
           <Btn tone="ghost" onClick={() => setStep("amount")}>{t(lang, "editAmt")}</Btn>
         </div>
       ) : null}
@@ -920,6 +1003,7 @@ function ReceiveScreen({ ping }: { ping: (msg: string) => void }) {
   const [asset, setAsset] = useState<"USDC" | "USDT">("USDC");
   const [chain, setChain] = useState("Base");
   const [req, setReq] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
 
   if (!me) return null;
   const tabs = [
@@ -929,7 +1013,22 @@ function ReceiveScreen({ ping }: { ping: (msg: string) => void }) {
     { id: "usd" as const, label: "tabSt" as const },
   ];
 
-  function make() {
+  async function make() {
+    if (isLiveConnected() && method !== "usd") {
+      try {
+        const res = await receiveLive({
+          method: method === "ln" ? "bolt11" : method === "spark" ? "spark" : "bitcoin",
+          amount: amt,
+          description: "CPay",
+          tokenIdentifier: "",
+        });
+        setReq(res.paymentRequest);
+        setErr(null);
+      } catch (error) {
+        setErr(explain(error));
+      }
+      return;
+    }
     if (method === "ln") {
       const sats = Math.round(Number(amt));
       setReq(Number.isFinite(sats) && sats > 0 ? `lnbc${sats}n1p${me!.id}` : `lnbcany1p${me!.id}`);
@@ -980,8 +1079,9 @@ function ReceiveScreen({ ping }: { ping: (msg: string) => void }) {
         </div>
       ) : null}
       <div className="mt-3">
-        <Btn onClick={make}>{t(lang, "make")}</Btn>
+        <Btn onClick={() => void make()}>{t(lang, "make")}</Btn>
       </div>
+      {err ? <p className="mt-3 text-sm text-danger">{err}</p> : null}
       {req ? (
         <div className="mt-4 flex flex-col items-center gap-3">
           <Qr value={req} />
@@ -1659,9 +1759,6 @@ function SettingsScreen({ close, ping }: { close: () => void; ping: (m: string) 
     <Frame>
       <BackTitle title={t(lang, "setH")} onBack={close} />
       <p className="text-sm text-muted">{t(lang, "setP")}</p>
-      <div className="mt-4">
-        <InstallCard />
-      </div>
       <section className="mt-5">
         <h2 className="text-base font-semibold">{t(lang, "apiSection")}</h2>
         <p className="mt-1 text-sm text-muted">{t(lang, "setKeyHelp")}</p>
@@ -1808,6 +1905,12 @@ function Main() {
       live = false;
     };
   }, [setPrice]);
+
+  const showAds = useCpay((s) => s.showAds);
+
+  useEffect(() => {
+    void startAds(showAds).catch(() => undefined);
+  }, [showAds]);
 
   function ping(msg: string) {
     setToast(msg);
