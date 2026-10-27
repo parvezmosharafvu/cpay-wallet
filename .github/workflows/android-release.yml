@@ -90,8 +90,11 @@ jobs:
         run: npm run build:mobile
       - name: Sync Android native project
         run: node node_modules/@capacitor/cli/bin/capacitor sync android
-      - name: Ensure Android SDK 36 tools
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Install Android SDK 36 tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+          log-accepted-android-sdk-licenses: false
       - name: Build native release APK
         working-directory: android
         run: ./gradlew --no-daemon assembleRelease
