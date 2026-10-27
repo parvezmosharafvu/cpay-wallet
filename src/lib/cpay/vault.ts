@@ -198,11 +198,13 @@ export class WalletVault {
   write(raw: string): Promise<void> {
     if (!this.key) return Promise.resolve(); // memory clearing on lock must not overwrite the vault
     assertWalletData(raw);
-    const key = this.key,
-      salt = this.salt,
-      epoch = this.epoch;
+    // Epoch marks unlock/lock/replacement, not a password rotation. A write
+    // queued during rotation must use the replacement key when it executes.
+    const epoch = this.epoch;
     const next = this.queue.then(async () => {
       if (this.epoch !== epoch || !this.key) return;
+      const key = this.key,
+        salt = this.salt;
       const expected = this.persisted;
       this.assertCurrent(epoch, expected);
       const e = await encrypt(raw, key, salt);
@@ -267,24 +269,34 @@ export class WalletVault {
     this.assertInputPassword(oldPassword);
     if (!this.key) throw new Error("Unlock the vault first.");
     const epoch = this.epoch;
-    await this.flush();
-    this.assertCurrent(epoch, this.persisted);
-    const expected = this.storage.getItem(VAULT_KEY);
-    if (!expected) throw new Error("Vault is missing.");
-    const existing = parseEnvelope(expected);
-    const raw = await decrypt(existing, await derive(oldPassword, unbase64(existing.salt)));
-    assertWalletData(raw);
-    this.assertCurrent(epoch, expected);
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const key = await derive(newPassword, salt);
-    const e = await encrypt(raw, key, base64(salt));
-    this.assertCurrent(epoch, expected);
-    const serialized = JSON.stringify(e);
-    this.storage.setItem(VAULT_KEY, serialized);
-    this.epoch++;
-    this.key = key;
-    this.salt = e.salt;
-    this.persisted = serialized;
+    // Rotation occupies the same queue as snapshots: it observes all preceding
+    // writes and cannot overtake writes that arrive while crypto is pending.
+    // Do not call flush() inside this task, since it would await itself.
+    const next = this.queue.then(async () => {
+      this.assertCurrent(epoch, this.persisted);
+      if (!this.key) throw new Error("Unlock the vault first.");
+      if (this.writeError) throw this.writeError;
+      const expected = this.storage.getItem(VAULT_KEY);
+      if (!expected) throw new Error("Vault is missing.");
+      const existing = parseEnvelope(expected);
+      const raw = await decrypt(existing, await derive(oldPassword, unbase64(existing.salt)));
+      assertWalletData(raw);
+      this.assertCurrent(epoch, expected);
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const key = await derive(newPassword, salt);
+      const e = await encrypt(raw, key, base64(salt));
+      this.assertCurrent(epoch, expected);
+      const serialized = JSON.stringify(e);
+      this.storage.setItem(VAULT_KEY, serialized);
+      this.key = key;
+      this.salt = e.salt;
+      this.persisted = serialized;
+      this.writeError = undefined;
+    });
+    this.queue = next.catch((error: unknown) => {
+      this.writeError = error;
+    });
+    return next;
   }
   destroy() {
     this.lock();

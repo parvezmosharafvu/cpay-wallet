@@ -20,8 +20,8 @@ Node 22.23.3 and npm 10.9.9, Windows:
 | --- | --- |
 | Clean npm ci | Passed; 444 packages |
 | TypeScript | Passed |
-| All script and TypeScript tests | 288 passed; 0 failed; 0 skipped |
-| Isolated browser flows | 15 passed; no page errors; mobile viewport without overflow |
+| All script and TypeScript tests | 298 passed; 0 failed; 0 skipped |
+| Isolated browser flows | 20 passed; no page errors; mobile viewport without overflow |
 | Production web build without migration | Passed |
 | Mobile web bundle | Passed |
 | Android/iOS Capacitor sync | Passed generation/sync; no native binary compilation |
@@ -38,3 +38,7 @@ A CoinGecko request already existed; its error/refresh/staleness behavior was im
 Physical Android/iOS devices, signed binaries, passkey RP/domain association, funded settlement/recovery tests, real Breez/AdMob credentials and consent configuration, store submissions and an independent security audit require those devices/accounts/services. None is claimed from CI. No real-money payment was made.
 
 Security references: https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/encrypt and https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html. Encryption at rest does not protect an unlocked wallet against hostile same-origin scripts or device compromise.
+
+## Follow-up review fixes
+
+Automated review findings were reproduced and corrected: stale async reconnects now require the original vault unlock capability; password rotation shares the persistence queue; explicit practice mode survives hydration; new name/account/price/settings bounds match backup validation while legacy long names remain readable; LNURL amount/comment edits preserve parsed requests. Added deterministic regressions, including lock/reunlock during delayed identity lookup and writes arriving during password rotation. CI uses hosted Chrome to avoid a redundant browser download.

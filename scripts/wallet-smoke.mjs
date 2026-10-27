@@ -36,17 +36,20 @@ async function sdkMockSource() {
   );
   names.push("sessionKeyFor");
   return `
-  const state=window.__walletMock={balance:1000,sends:0,prepared:0,status:'pending',payments:[]};
-  let quote=null;
+  const state=window.__walletMock={balance:1000,sends:0,prepared:0,status:'pending',payments:[],ensures:0,hashCalls:0,delayHashes:false,hashes:[]};
+  let quote=null,parsedRequest=null,lnurlQuote=null;
   const api={
-    ensureLive:async()=>true,
+    ensureLive:async()=>{state.ensures++;return true;},
     connectLive:async()=>({balanceSats:state.balance}),
     disconnectLive:async()=>{},clearLiveStorage:async()=>{},
-    sessionKeyFor:async()=>({key:'smoke-session',network:'regtest',account:0}),
+    sessionKeyFor:async()=>{state.hashCalls++;if(state.delayHashes)await new Promise(resolve=>state.hashes.push(resolve));return {key:'smoke-session',network:'regtest',account:0};},
     currentLiveSession:()=>({key:'smoke-session',network:'regtest',account:0}),
     isSessionCurrent:key=>key==='smoke-session',isLiveConnected:()=>true,
     liveInfo:async()=>({balanceSats:state.balance}),listLiveHistory:async()=>state.payments,
-    invalidateLiveQuotes:()=>{quote=null;},explain:error=>String(error.message||error),
+    invalidateLiveQuotes:({preserveParsed=false}={})=>{quote=null;lnurlQuote=null;if(!preserveParsed)parsedRequest=null;},explain:error=>String(error.message||error),
+    parseLive:async input=>{parsedRequest={type:'lnurlPay',input};return parsedRequest;},
+    prepareLnurlLive:async(amount,comment)=>{if(!parsedRequest)throw Error('Parse the LNURL first');lnurlQuote={amount,comment,input:parsedRequest.input};state.lnurlPrepared=lnurlQuote;return lnurlQuote;},
+    payLnurlLive:async()=>{if(!lnurlQuote)throw Error('Prepare the LNURL first');return {id:'synthetic-lnurl',status:'pending'};},
     prepareLiveQuote:async input=>{state.prepared++;quote={id:'quote-'+state.prepared,sessionKey:'smoke-session',destination:input.destination,amountSats:Number(input.amount),feeSats:7,totalSats:Number(input.amount)+7,network:'regtest',expiresAt:Date.now()+60000,speed:input.speed};return quote;},
     executeLiveQuote:async id=>{if(!quote||quote.id!==id)throw Error('Missing quote');state.sends++;await new Promise(r=>setTimeout(r,150));const result={id:'synthetic-payment-'+state.sends,status:state.status,amountSats:quote.amountSats,feeSats:7,timestamp:Date.now(),method:'spark',direction:'out'};state.payments=[result];state.balance-=quote.totalSats;quote=null;return result;},
     receiveLive:async()=>({paymentRequest:'spark-regtest-synthetic-request'}),
@@ -151,6 +154,17 @@ try {
   await page.getByRole("button", { name: "Lock wallet now", exact: true }).click();
   await visible(page.getByRole("heading", { name: "Unlock your wallet", exact: true }));
   steps.push("manual lock hides wallet");
+  const lockedSdkError = await page.evaluate(async (publicPhrase) => {
+    const sdk = await import("/src/lib/cpay/sdk.ts");
+    try {
+      await sdk.connectLive({ mnemonic: publicPhrase, network: "regtest", account: 0, apiKey: "" });
+      return "UNEXPECTED CONNECTION";
+    } catch (error) {
+      return error.message;
+    }
+  }, fixture);
+  assert.match(lockedSdkError, /unlock|vault/i);
+  steps.push("actual SDK rejects live connect while vault is locked before network/WASM");
   const second = await context();
   const imported = second.page;
   await imported.locator('input[type="file"]').setInputFiles(backup);
@@ -291,7 +305,90 @@ try {
     }),
   );
   steps.push("stored seed reveal requires vault reauthentication");
+  await live.getByRole("button", { name: "Back", exact: true }).click();
+  await live.getByRole("button", { name: /^Breez live/ }).click();
+  await live.getByRole("button", { name: "LNURL", exact: true }).click();
+  await live.getByLabel("LNURL", { exact: true }).fill("lnurl-synthetic-request");
+  await live.getByRole("button", { name: "Parse", exact: true }).click();
+  await live.getByLabel("Amount", { exact: true }).fill("100");
+  await live.getByRole("button", { name: "Prepare", exact: true }).click();
+  await live.waitForFunction(() => window.__walletMock.lnurlPrepared?.amount === "100");
+  assert.equal(await live.getByRole("button", { name: "Pay", exact: true }).isEnabled(), true);
+  await live.getByLabel("Comment", { exact: true }).fill("updated comment");
+  assert.equal(await live.getByRole("button", { name: "Pay", exact: true }).isEnabled(), false);
+  await live.getByRole("button", { name: "Prepare", exact: true }).click();
+  await live.waitForFunction(
+    () => window.__walletMock.lnurlPrepared?.comment === "updated comment",
+  );
+  await live.getByLabel("LNURL", { exact: true }).fill("different-lnurl");
+  assert.equal(await live.getByRole("button", { name: "Prepare", exact: true }).isEnabled(), false);
+  steps.push(
+    "LNURL parse survives amount/comment edits; prepared payment invalidates; input change requires reparse",
+  );
   await mocked.context.close();
+  for (const scenario of ["refresh", "send", "receive"]) {
+    const delayed = await context({ mockSdk: true });
+    const delayedPage = delayed.page;
+    await createVault(delayedPage);
+    await delayedPage
+      .getByRole("button", { name: "Restore live wallet (BIP39)", exact: true })
+      .click();
+    await delayedPage.locator("textarea").fill(fixture);
+    await delayedPage.getByRole("button", { name: "Restore", exact: true }).click();
+    await visible(
+      delayedPage.getByText("Live SDK · regtest · Account 0. Keep your recovery backup safe.", {
+        exact: true,
+      }),
+    );
+    if (scenario === "send")
+      await delayedPage
+        .getByRole("navigation", { name: "Primary" })
+        .getByRole("button", { name: "Send", exact: true })
+        .click();
+    if (scenario === "receive")
+      await delayedPage
+        .getByRole("navigation", { name: "Primary" })
+        .getByRole("button", { name: "Receive", exact: true })
+        .click();
+    await delayedPage.evaluate(() => {
+      window.__walletMock.delayHashes = true;
+    });
+    if (scenario === "refresh")
+      await delayedPage.getByRole("button", { name: "Refresh balance", exact: true }).click();
+    if (scenario === "send") {
+      await delayedPage
+        .getByLabel("Destination / invoice / LNURL", { exact: true })
+        .fill("spark-regtest-recipient");
+      await delayedPage
+        .getByLabel("Amount (sats, optional for fixed invoice)", { exact: true })
+        .fill("100");
+      await delayedPage.getByRole("button", { name: "Get quote and review", exact: true }).click();
+    }
+    if (scenario === "receive")
+      await delayedPage
+        .getByRole("button", { name: "Create payment request", exact: true })
+        .click();
+    await delayedPage.waitForFunction(() => window.__walletMock.hashes.length > 0);
+    await settings(delayedPage);
+    await delayedPage.getByRole("button", { name: "Lock wallet now", exact: true }).click();
+    await visible(delayedPage.getByRole("heading", { name: "Unlock your wallet", exact: true }));
+    const ensureCount = await delayedPage.evaluate(() => {
+      const old = window.__walletMock.hashes.splice(0);
+      window.__walletMock.releaseOld = () => old.forEach((resolve) => resolve());
+      return window.__walletMock.ensures;
+    });
+    await unlock(delayedPage);
+    await visible(
+      delayedPage.getByText("Live SDK · regtest · Account 0. Keep your recovery backup safe.", {
+        exact: true,
+      }),
+    );
+    await delayedPage.evaluate(() => window.__walletMock.releaseOld());
+    await delayedPage.waitForTimeout(100);
+    assert.equal(await delayedPage.evaluate(() => window.__walletMock.ensures), ensureCount);
+    steps.push(`delayed ${scenario} identity lookup cannot reconnect after vault lock/unlock`);
+    await delayed.context.close();
+  }
   assert.deepEqual(failures, []);
   console.log(JSON.stringify({ ok: true, steps }, null, 2));
   await first.context.close();
