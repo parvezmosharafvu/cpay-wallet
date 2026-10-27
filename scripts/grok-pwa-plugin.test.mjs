@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   appNameFromHost,
-  createHeadInjector,
+  createHeadInjector as actualHeadInjector,
   grokXCreatorHeadTags,
-  injectGrokPwaHead,
+  injectGrokPwaHead as actualPwaHead,
   isDocumentPath,
   isInstallQuery,
   publicAppHost,
@@ -18,6 +18,14 @@ import {
   stripInstallParams,
 } from "./grok-pwa-shared.mjs";
 import { renderInstallPage } from "./grok-pwa-plugin.mjs";
+
+// Generic injector tests must not inherit this wallet's production site.json.
+const emptySiteRoot = mkdtempSync(join(tmpdir(), "cpay-pwa-fixture-"));
+const injectGrokPwaHead = (html, context = {}) => actualPwaHead(html, { site: {}, cwd: emptySiteRoot, ...context });
+const createHeadInjector = (context = {}) => actualHeadInjector({ site: {}, cwd: emptySiteRoot, ...context });
+
+// Explicitly enable generator chrome in generic tests; wallet production defaults off.
+process.env.VITE_GROK_EXTENSIONS = "1";
 
 const TEMPLATE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -539,3 +547,10 @@ test("vite plugin bakes og identity as a virtual module", () => {
   assert.match(plugin, /snapshotOgIdentity/);
 });
 
+
+test("wallet default never injects an unrequested third-party script", () => {
+  const before = process.env.VITE_GROK_EXTENSIONS;
+  delete process.env.VITE_GROK_EXTENSIONS;
+  try { assert.doesNotMatch(injectGrokPwaHead("<html><head></head></html>"), /grok-app-builder\/extensions\.js/); }
+  finally { if (before !== undefined) process.env.VITE_GROK_EXTENSIONS = before; }
+});

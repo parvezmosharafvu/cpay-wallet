@@ -13,11 +13,29 @@ import type {
   UnilateralExitResponse,
 } from "@breeztech/breez-sdk-spark/web";
 import { appBreezKey } from "./app-key";
+import { mnemonicToEntropy, validateMnemonic } from "@scure/bip39";
+import { wordlist } from "@scure/bip39/wordlists/english.js";
+import {
+  LiveSession,
+  StaleSessionError,
+  normalizeMnemonic,
+  sessionIdentity,
+  type SessionIdentity,
+} from "./live-session";
+import {
+  QuoteBook,
+  normalizePayment,
+  quotedFee,
+  safeSats,
+  type LivePayment,
+  type LiveQuote,
+} from "./payment-quote";
+import { decryptSdkCache, deriveSdkCacheKey, encryptSdkCache } from "./sdk-cache";
+export type { LivePayment, LiveQuote } from "./payment-quote";
 
 type SdkModule = typeof import("@breeztech/breez-sdk-spark/web");
 
 let modulePromise: Promise<SdkModule> | null = null;
-let sdk: BreezSdk | null = null;
 let prepared: PrepareSendPaymentResponse | null = null;
 let preparedLnurl: PrepareLnurlPayResponse | null = null;
 let parsed: InputType | null = null;
@@ -26,11 +44,100 @@ let lastExitPlan: PrepareUnilateralExitResponse | null = null;
 let lastExit: UnilateralExitResponse | null = null;
 let lastAuth: TransferAuthorization | null = null;
 let listenerId: string | null = null;
+const listeners = new Map<BreezSdk, string>();
+const storageHandles = new Map<string, Set<{ close: () => void }>>();
+const cacheKeys = new Map<string, CryptoKey>();
+const STORAGE_REGISTRY = "cpay-sdk-databases-v2";
+let legacySessionKey: string | null = null;
+let legacyQuoteGeneration = 0;
+let requestVersion = 0;
+let activeFingerprint = "";
+let opening: {
+  fingerprint: string;
+  promise: Promise<Awaited<ReturnType<BreezSdk["getInfo"]>>>;
+} | null = null;
+
+function clearPrepared() {
+  prepared = null;
+  preparedLnurl = null;
+  parsed = null;
+  preparedBatch = null;
+  lastExitPlan = null;
+  lastExit = null;
+  lastAuth = null;
+  lastLinkAddress = "";
+  routes = [];
+  legacySessionKey = null;
+  ++legacyQuoteGeneration;
+  quotes.invalidate();
+}
+
+function closeSdkStores() {
+  for (const handles of storageHandles.values())
+    for (const storage of handles) {
+      try {
+        storage.close();
+      } catch {
+        /* Deletion reports a blocked cache if a browser handle stays open. */
+      }
+    }
+  storageHandles.clear();
+  cacheKeys.clear();
+}
+
+async function buildSdkClient(create: () => Promise<BreezSdk>): Promise<BreezSdk> {
+  try {
+    return await create();
+  } catch (error) {
+    closeSdkStores();
+    throw error;
+  }
+}
+
+const sessions = new LiveSession<BreezSdk>(
+  async (client) => {
+    const listener = listeners.get(client);
+    listeners.delete(client);
+    if (listener) await client.removeEventListener(listener).catch(() => undefined);
+    try {
+      await client.disconnect();
+    } finally {
+      try {
+        client.free();
+      } finally {
+        closeSdkStores();
+      }
+    }
+  },
+  () => {
+    activeFingerprint = "";
+    cacheKeys.clear();
+    clearPrepared();
+  },
+);
+
+type QuotedSdkResponse =
+  | { type: "send"; response: PrepareSendPaymentResponse }
+  | { type: "lnurl"; response: PrepareLnurlPayResponse };
+const quotes = new QuoteBook<QuotedSdkResponse>((key) => sessions.isCurrent(key));
 
 export type LiveNetwork = Extract<Network, "mainnet" | "regtest">;
 
 export function isLiveConnected() {
-  return sdk !== null;
+  return sessions.current() !== null;
+}
+
+export function currentLiveSession(): SessionIdentity | null {
+  return sessions.current()?.identity ?? null;
+}
+
+export function isSessionCurrent(key: string) {
+  return sessions.isCurrent(key);
+}
+export { sessionIdentity as sessionKeyFor } from "./live-session";
+
+export function invalidateLiveQuotes() {
+  clearPrepared();
 }
 
 function browserOnly() {
@@ -40,51 +147,105 @@ function browserOnly() {
 async function load(): Promise<SdkModule> {
   browserOnly();
   if (!modulePromise) {
-    modulePromise = import("@breeztech/breez-sdk-spark/web").then(async (mod) => {
-      await mod.default();
-      return mod;
-    });
+    modulePromise = import("@breeztech/breez-sdk-spark/web")
+      .then(async (mod) => {
+        await mod.default();
+        // The SDK's documented browser adapter is exposed as these factories.
+        // Track only this application's handles so full erase can close/delete them.
+        type BrowserSdkStorage = {
+          close: () => void;
+          getCachedItem?: (key: string) => Promise<string | null>;
+          setCachedItem?: (key: string, value: string) => Promise<void>;
+        };
+        const bridge = globalThis as typeof globalThis & {
+          createDefaultStorage?: (name: string, logger?: unknown) => Promise<BrowserSdkStorage>;
+          createDefaultTreeStore?: (name: string, logger?: unknown) => Promise<BrowserSdkStorage>;
+        };
+        for (const key of ["createDefaultStorage", "createDefaultTreeStore"] as const) {
+          const factory = bridge[key];
+          if (factory)
+            bridge[key] = async (name, logger) => {
+              const storage = await factory(name, logger);
+              if (name.startsWith("cpay-")) {
+                const handles = storageHandles.get(name) ?? new Set();
+                handles.add(storage);
+                storageHandles.set(name, handles);
+                if (cacheKeys.has(name) && storage.getCachedItem && storage.setCachedItem) {
+                  const read = storage.getCachedItem.bind(storage),
+                    write = storage.setCachedItem.bind(storage);
+                  storage.getCachedItem = async (item) => {
+                    const raw = await read(item);
+                    const cacheKey = cacheKeys.get(name);
+                    if (!cacheKey)
+                      throw new Error("Unlock the selected wallet to read its SDK cache.");
+                    const plaintext =
+                      raw === null
+                        ? null
+                        : await decryptSdkCache(raw, cacheKey, `${name}\0${item}`);
+                    if (cacheKeys.get(name) !== cacheKey)
+                      throw new Error("The wallet was locked before the SDK cache read completed.");
+                    return plaintext;
+                  };
+                  storage.setCachedItem = async (item, value) => {
+                    const cacheKey = cacheKeys.get(name);
+                    if (!cacheKey)
+                      throw new Error("Unlock the selected wallet to write its SDK cache.");
+                    const raw = await encryptSdkCache(value, cacheKey, `${name}\0${item}`);
+                    if (cacheKeys.get(name) !== cacheKey)
+                      throw new Error(
+                        "The wallet was locked before the SDK cache write completed.",
+                      );
+                    await write(item, raw);
+                  };
+                }
+              }
+              return storage;
+            };
+        }
+        return mod;
+      })
+      .catch((error) => {
+        modulePromise = null;
+        throw error;
+      });
   }
   return modulePromise;
-}
-
-async function adopt(next: BreezSdk) {
-  if (listenerId && sdk) {
-    try {
-      await sdk.removeEventListener(listenerId);
-    } catch {
-      /* listener may already be gone */
-    }
-  }
-  listenerId = null;
-  if (sdk) {
-    try {
-      await sdk.disconnect();
-    } catch {
-      /* a failed disconnect should not block a new session */
-    }
-  }
-  sdk = next;
-  prepared = null;
-  preparedLnurl = null;
-  preparedBatch = null;
-  lastExitPlan = null;
-  lastExit = null;
-  lastAuth = null;
 }
 
 let routes: CrossChainRoutePair[] = [];
 
 function need() {
-  if (!sdk) throw new Error("Connect the live wallet first.");
-  return sdk;
+  return sessions.need().client;
+}
+
+async function inSession<T>(task: (client: BreezSdk) => Promise<T>): Promise<T> {
+  const session = sessions.need();
+  const result = await task(session.client);
+  if (!sessions.isCurrent(session.identity.key)) throw new StaleSessionError();
+  return result;
+}
+
+function rememberStorage(name: string) {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(STORAGE_REGISTRY) ?? "[]");
+    const names = Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string" && item.startsWith("cpay-"))
+      : [];
+    localStorage.setItem(
+      STORAGE_REGISTRY,
+      JSON.stringify([...new Set([...names, name, `${name}-tree`])]),
+    );
+  } catch {
+    /* Database enumeration remains available if persistent storage is denied. */
+  }
 }
 
 function hexToBytes(hex: string) {
   const clean = hex.trim().replace(/^0x/, "");
   if (!/^[0-9a-fA-F]+$/.test(clean) || clean.length % 2 !== 0) throw new Error("Key must be hex.");
   const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < out.length; i += 1) out[i] = Number.parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  for (let i = 0; i < out.length; i += 1)
+    out[i] = Number.parseInt(clean.slice(i * 2, i * 2 + 2), 16);
   return out;
 }
 
@@ -100,68 +261,143 @@ function familyOf(address: string): "evm" | "solana" | "tron" {
   return "solana";
 }
 
-export async function connectLive(input: {
+export type LiveConnection = {
   mnemonic: string;
   apiKey: string;
   network: LiveNetwork;
   account: number;
-}) {
-  const mod = await load();
-  if (sdk) {
-    try {
-      await sdk.disconnect();
-    } catch {
-      /* a failed disconnect should not block a new session */
+};
+
+export function connectLive(input: LiveConnection) {
+  const normalized = {
+    ...input,
+    mnemonic: normalizeMnemonic(input.mnemonic),
+    apiKey: input.apiKey.trim(),
+  };
+  const fingerprint = JSON.stringify(normalized);
+  if (opening?.fingerprint === fingerprint) return opening.promise;
+  const previousOpening = opening;
+  const version = ++requestVersion;
+  // Revoke a different connected wallet before hashing or loading WASM.
+  const active = sessions.current();
+  if ((active && activeFingerprint !== fingerprint) || previousOpening)
+    void sessions.disconnect().catch(() => undefined);
+  const promise = (async () => {
+    if (!validateMnemonic(normalized.mnemonic, wordlist)) {
+      await sessions.disconnect();
+      throw new Error("Enter a valid BIP39 recovery phrase.");
     }
-    sdk = null;
-  }
-  const config = mod.defaultConfig(input.network);
-  const key = input.apiKey.trim();
-  if (key) config.apiKey = key;
-  else if (input.network === "mainnet") throw new Error("Mainnet needs your Breez API key.");
-  let builder = mod.SdkBuilder.new(config, {
-    type: "mnemonic",
-    mnemonic: input.mnemonic.trim(),
+    if (normalized.network === "mainnet" && !normalized.apiKey) {
+      await sessions.disconnect();
+      throw new Error("Mainnet needs a Breez API key. Add it in Settings.");
+    }
+    const identity = await sessionIdentity(normalized);
+    if (version !== requestVersion) throw new StaleSessionError();
+    const client = await sessions.connect(identity, () =>
+      buildSdkClient(async () => {
+        const mod = await load();
+        if (version !== requestVersion) throw new StaleSessionError();
+        const config = mod.defaultConfig(normalized.network);
+        if (normalized.apiKey) config.apiKey = normalized.apiKey;
+        let builder = mod.SdkBuilder.new(config, {
+          type: "mnemonic",
+          mnemonic: normalized.mnemonic,
+        });
+        builder = builder.withAccountNumber(normalized.account);
+        const storageName = `cpay-sdk-v3-${identity.key}`;
+        rememberStorage(storageName);
+        const cacheKey = await deriveSdkCacheKey(
+          mnemonicToEntropy(normalized.mnemonic, wordlist),
+          storageName,
+        );
+        if (version !== requestVersion) throw new StaleSessionError();
+        cacheKeys.set(storageName, cacheKey);
+        builder = await builder.withDefaultStorage(storageName);
+        return builder.build();
+      }),
+    );
+    if (version !== requestVersion || !sessions.isCurrent(identity.key))
+      throw new StaleSessionError();
+    activeFingerprint = fingerprint;
+    const info = await client.getInfo({
+      ensureSynced: !active || active.identity.key !== identity.key,
+    });
+    if (version !== requestVersion || !sessions.isCurrent(identity.key))
+      throw new StaleSessionError();
+    return info;
+  })();
+  opening = { fingerprint, promise };
+  void promise
+    .finally(() => {
+      if (opening?.promise === promise) opening = null;
+    })
+    .catch(() => undefined);
+  return promise;
+}
+
+export async function ensureLive(
+  mnemonic: string,
+  options: {
+    apiKey?: string;
+    network?: LiveNetwork;
+    account?: number;
+  } = {},
+) {
+  await connectLive({
+    mnemonic,
+    apiKey: options.apiKey?.trim() || appBreezKey(),
+    network: options.network ?? "mainnet",
+    account: options.account ?? 0,
   });
-  builder = builder.withAccountNumber(input.account);
-  builder = await builder.withDefaultStorage(`cpay-${input.network}-a${input.account}`);
-  await adopt(await builder.build());
-  return liveInfo(true);
+  return true;
 }
 
-let opening: Promise<boolean> | null = null;
-
-export async function ensureLive(mnemonic: string) {
-  const key = appBreezKey();
-  const phrase = mnemonic.trim();
-  if (!key || !phrase) return false;
-  if (isLiveConnected()) return true;
-  if (!opening) {
-    opening = connectLive({ mnemonic: phrase, apiKey: key, network: "mainnet", account: 0 })
-      .then(() => true)
-      .catch(() => false)
-      .finally(() => {
-        opening = null;
-      });
-  }
-  return opening;
+export function disconnectLive() {
+  ++requestVersion;
+  opening = null;
+  listenerId = null;
+  return sessions.disconnect();
 }
 
-export async function disconnectLive() {
-  if (!sdk) return;
-  if (listenerId) {
-    try {
-      await sdk.removeEventListener(listenerId);
-    } catch {
-      /* already removed */
-    }
-    listenerId = null;
+/** Delete this app's SDK caches, including legacy shared namespaces. */
+export async function clearLiveStorage() {
+  await disconnectLive();
+  if (typeof indexedDB === "undefined") return;
+  let registered: string[] = [];
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(STORAGE_REGISTRY) ?? "[]");
+    if (Array.isArray(value))
+      registered = value.filter(
+        (name): name is string => typeof name === "string" && name.startsWith("cpay-"),
+      );
+  } catch {
+    /* Do not trust the registry; enumerate when supported. */
   }
-  await sdk.disconnect();
-  sdk = null;
-  prepared = null;
-  preparedLnurl = null;
-  preparedBatch = null;
+  const databases = typeof indexedDB.databases === "function" ? await indexedDB.databases() : [];
+  const names = new Set([
+    ...registered,
+    ...databases
+      .map((entry) => entry.name)
+      .filter((name): name is string => !!name && name.startsWith("cpay-")),
+    "cpay-mainnet-a0",
+    "cpay-mainnet-a0-tree",
+    "cpay-regtest-a0",
+    "cpay-regtest-a0-tree",
+  ]);
+  await Promise.all(
+    [...names].map(
+      (name) =>
+        new Promise<void>((resolve, reject) => {
+          const request = indexedDB.deleteDatabase(name);
+          request.onsuccess = () => resolve();
+          request.onerror = () =>
+            reject(request.error ?? new Error("Could not erase the SDK database."));
+          request.onblocked = () =>
+            reject(new Error("Close other CPay tabs before erasing wallet data."));
+        }),
+    ),
+  );
+  localStorage.removeItem(STORAGE_REGISTRY);
 }
 
 export async function sparkStatus() {
@@ -170,19 +406,30 @@ export async function sparkStatus() {
 }
 
 export async function syncLive() {
-  return need().syncWallet({});
+  return inSession((client) => client.syncWallet({}));
 }
 
 export async function liveInfo(ensureSynced = false) {
-  return need().getInfo({ ensureSynced });
+  return inSession((client) => client.getInfo({ ensureSynced }));
 }
 
 export async function listLivePayments() {
-  return need().listPayments({ limit: 25, sortAscending: false });
+  return inSession((client) => client.listPayments({ limit: 50, sortAscending: false }));
+}
+
+export async function listLiveHistory(): Promise<LivePayment[]> {
+  const response = await listLivePayments();
+  // Token amounts have separate units and are shown in the advanced panel.
+  return response.payments.filter((payment) => payment.method !== "token").map(normalizePayment);
 }
 
 export async function parseLive(input: string) {
-  parsed = await need().parse(input.trim());
+  clearPrepared();
+  const generation = legacyQuoteGeneration;
+  const response = await inSession((client) => client.parse(input.trim()));
+  if (generation !== legacyQuoteGeneration)
+    throw new Error("Payment details changed. Parse the destination again.");
+  parsed = response;
   return parsed;
 }
 
@@ -191,27 +438,128 @@ export async function prepareLiveSend(input: {
   amount: string;
   tokenIdentifier: string;
 }) {
+  const generation = ++legacyQuoteGeneration;
+  prepared = null;
+  const session = sessions.need();
   const amount = input.amount.trim() ? asBig(input.amount, "Amount") : undefined;
-  prepared = await need().prepareSendPayment({
-    paymentRequest: { type: "input", input: input.destination.trim() },
-    amount,
-    tokenIdentifier: input.tokenIdentifier.trim() || undefined,
-    feePolicy: "feesExcluded",
-  });
+  const response = await inSession((client) =>
+    client.prepareSendPayment({
+      paymentRequest: { type: "input", input: input.destination.trim() },
+      amount,
+      tokenIdentifier: input.tokenIdentifier.trim() || undefined,
+      feePolicy: "feesExcluded",
+    }),
+  );
+  if (generation !== legacyQuoteGeneration)
+    throw new Error("Payment details changed. Prepare the payment again.");
+  legacySessionKey = session.identity.key;
+  prepared = response;
   return prepared;
 }
 
+export async function prepareLiveQuote(input: {
+  destination: string;
+  amount: string;
+  tokenIdentifier?: string;
+  speed?: OnchainConfirmationSpeed;
+}): Promise<LiveQuote> {
+  const session = sessions.need();
+  const generation = quotes.generation();
+  const destination = input.destination.trim();
+  if (!destination) throw new Error("Enter a payment destination.");
+  if (input.tokenIdentifier?.trim())
+    throw new Error("Token payments use different amount units. Use the advanced SDK panel.");
+  const amount = input.amount.trim() ? asBig(input.amount, "Amount") : undefined;
+  if (amount !== undefined && amount <= 0n) throw new Error("Amount must be greater than zero.");
+  const speed = input.speed ?? "medium";
+  const parsedInput = await inSession((client) => client.parse(destination));
+  let sdkResponse: QuotedSdkResponse;
+  let feeSats: number;
+  let amountSats: number;
+  let expiresAt = Date.now() + 120_000;
+  if (parsedInput.type === "lightningAddress" || parsedInput.type === "lnurlPay") {
+    if (!amount) throw new Error("Enter the amount in sats for this Lightning address or LNURL.");
+    const response = await inSession((client) =>
+      client.prepareLnurlPay({
+        amount,
+        payRequest: parsedInput.type === "lightningAddress" ? parsedInput.payRequest : parsedInput,
+        feePolicy: "feesExcluded",
+        validateSuccessActionUrl: true,
+      }),
+    );
+    sdkResponse = { type: "lnurl", response };
+    feeSats = safeSats(response.feeSats, "Fee");
+    amountSats = safeSats(response.amountSats);
+  } else {
+    const response = await inSession((client) =>
+      client.prepareSendPayment({
+        paymentRequest: { type: "input", input: destination },
+        amount,
+        feePolicy: "feesExcluded",
+      }),
+    );
+    sdkResponse = { type: "send", response };
+    feeSats = quotedFee(response, speed);
+    amountSats = safeSats(response.amount);
+    if (response.paymentMethod.type === "bitcoinAddress") {
+      const expiry = response.paymentMethod.feeQuote.expiresAt;
+      expiresAt = Math.min(expiresAt, expiry > 1e12 ? expiry : expiry * 1000);
+    }
+  }
+  if (!sessions.isCurrent(session.identity.key)) throw new StaleSessionError();
+  if (amountSats <= 0) throw new Error("The prepared payment has no positive amount.");
+  const totalSats = safeSats(BigInt(amountSats) + BigInt(feeSats), "Total");
+  return quotes.add(
+    {
+      id: crypto.randomUUID(),
+      sessionKey: session.identity.key,
+      destination,
+      amountSats,
+      feeSats,
+      totalSats,
+      network: session.identity.network,
+      expiresAt,
+      speed,
+    },
+    sdkResponse,
+    generation,
+  );
+}
+
+export function executeLiveQuote(id: string): Promise<LivePayment> {
+  return quotes.execute(id, async (item, quote) => {
+    const client = sessions.need().client;
+    const result =
+      item.type === "lnurl"
+        ? await client.lnurlPay({ prepareResponse: item.response, idempotencyKey: quote.id })
+        : await client.sendPayment({
+            prepareResponse: item.response,
+            options:
+              item.response.paymentMethod.type === "bitcoinAddress"
+                ? { type: "bitcoinAddress", confirmationSpeed: quote.speed }
+                : item.response.paymentMethod.type === "bolt11Invoice"
+                  ? { type: "bolt11Invoice", preferSpark: false }
+                  : undefined,
+            idempotencyKey: quote.id,
+          });
+    // A pending/failed response must never be turned into a success receipt.
+    return normalizePayment(result.payment);
+  });
+}
+
 export async function getLivePayment(paymentId: string) {
-  return need().getPayment({ paymentId: paymentId.trim() });
+  return inSession((client) => client.getPayment({ paymentId: paymentId.trim() }));
 }
 
 export async function buildUnsignedBatchLive() {
-  if (!preparedBatch) throw new Error("Prepare the batch first.");
+  if (!preparedBatch || !legacySessionKey || !sessions.isCurrent(legacySessionKey))
+    throw new Error("Prepare the batch in the selected wallet first.");
   return need().buildUnsignedBatchPackage({ prepareResponse: preparedBatch });
 }
 
 export async function buildUnsignedLnurlLive() {
-  if (!preparedLnurl) throw new Error("Prepare the LNURL payment first.");
+  if (!preparedLnurl || !legacySessionKey || !sessions.isCurrent(legacySessionKey))
+    throw new Error("Prepare the LNURL payment in the selected wallet first.");
   return need().buildUnsignedLnurlPayPackage({ prepareResponse: preparedLnurl });
 }
 
@@ -224,21 +572,28 @@ export async function publishLnurlLive(raw: string) {
 }
 
 export async function sendLive(speed: OnchainConfirmationSpeed) {
-  if (!prepared) throw new Error("Prepare the payment first.");
-  const method = prepared.paymentMethod;
+  if (!prepared || !legacySessionKey || !sessions.isCurrent(legacySessionKey))
+    throw new Error("Prepare the payment in the selected wallet first.");
+  const response = prepared;
+  prepared = null;
+  const method = response.paymentMethod;
   const options =
     method.type === "bitcoinAddress"
       ? { type: "bitcoinAddress" as const, confirmationSpeed: speed }
       : method.type === "bolt11Invoice"
-        ? { type: "bolt11Invoice" as const, preferSpark: true }
+        ? { type: "bolt11Invoice" as const, preferSpark: false }
         : undefined;
-  const result = await need().sendPayment({ prepareResponse: prepared, options });
-  prepared = null;
+  const result = await need().sendPayment({
+    prepareResponse: response,
+    options,
+    idempotencyKey: crypto.randomUUID(),
+  });
   return result;
 }
 
 export async function buildUnsignedLive() {
-  if (!prepared) throw new Error("Prepare the payment first.");
+  if (!prepared || !legacySessionKey || !sessions.isCurrent(legacySessionKey))
+    throw new Error("Prepare the payment in the selected wallet first.");
   return need().buildUnsignedTransferPackage({ prepareResponse: prepared });
 }
 
@@ -251,63 +606,90 @@ export async function receiveLive(input: {
   const description = input.description.trim() || "CPay";
   const amount = input.amount.trim();
   if (input.method === "spark") {
-    return need().receivePayment({ paymentMethod: { type: "sparkAddress" } });
+    return inSession((client) =>
+      client.receivePayment({ paymentMethod: { type: "sparkAddress" } }),
+    );
   }
   if (input.method === "bitcoin") {
-    return need().receivePayment({ paymentMethod: { type: "bitcoinAddress" } });
+    return inSession((client) =>
+      client.receivePayment({ paymentMethod: { type: "bitcoinAddress" } }),
+    );
   }
   if (input.method === "sparkInvoice") {
-    return need().receivePayment({
-      paymentMethod: {
-        type: "sparkInvoice",
-        description,
-        amount: amount || undefined,
-        tokenIdentifier: input.tokenIdentifier.trim() || undefined,
-      },
-    });
+    return inSession((client) =>
+      client.receivePayment({
+        paymentMethod: {
+          type: "sparkInvoice",
+          description,
+          amount: amount || undefined,
+          tokenIdentifier: input.tokenIdentifier.trim() || undefined,
+        },
+      }),
+    );
   }
-  return need().receivePayment({
-    paymentMethod: {
-      type: "bolt11Invoice",
-      description,
-      amountSats: amount ? Number(asBig(amount, "Amount")) : undefined,
-    },
-  });
+  return inSession((client) =>
+    client.receivePayment({
+      paymentMethod: {
+        type: "bolt11Invoice",
+        description,
+        amountSats: amount ? safeSats(asBig(amount, "Amount")) : undefined,
+      },
+    }),
+  );
 }
 
 export async function loadReceiveRoutes() {
-  routes = await need().getCrossChainRoutes({ type: "receive" });
+  routes = await inSession((client) => client.getCrossChainRoutes({ type: "receive" }));
   return routes;
 }
 
 export async function receiveOnRoute(index: number, amount: string) {
   const route = routes[index];
   if (!route) throw new Error("Load routes, then pick one.");
-  return need().receivePayment({
-    paymentMethod: { type: "crossChain", route, amount: asBig(amount, "Amount").toString() },
-  });
+  return inSession((client) =>
+    client.receivePayment({
+      paymentMethod: { type: "crossChain", route, amount: asBig(amount, "Amount").toString() },
+    }),
+  );
 }
 
 export async function prepareLnurlLive(amount: string, comment: string) {
-  if (!parsed || parsed.type !== "lnurlPay") throw new Error("Parse an LNURL-pay or Lightning address first.");
-  preparedLnurl = await need().prepareLnurlPay({
-    amount: asBig(amount, "Amount"),
-    comment: comment.trim() || undefined,
-    payRequest: parsed,
-    feePolicy: "feesExcluded",
-  });
+  if (!parsed || parsed.type !== "lnurlPay")
+    throw new Error("Parse an LNURL-pay or Lightning address first.");
+  const session = sessions.need();
+  const generation = ++legacyQuoteGeneration;
+  const payRequest = parsed;
+  preparedLnurl = null;
+  const response = await inSession((client) =>
+    client.prepareLnurlPay({
+      amount: asBig(amount, "Amount"),
+      comment: comment.trim() || undefined,
+      payRequest,
+      feePolicy: "feesExcluded",
+    }),
+  );
+  if (generation !== legacyQuoteGeneration)
+    throw new Error("Payment details changed. Prepare the LNURL payment again.");
+  legacySessionKey = session.identity.key;
+  preparedLnurl = response;
   return preparedLnurl;
 }
 
 export async function payLnurlLive() {
-  if (!preparedLnurl) throw new Error("Prepare the LNURL payment first.");
-  const result = await need().lnurlPay({ prepareResponse: preparedLnurl });
+  if (!preparedLnurl || !legacySessionKey || !sessions.isCurrent(legacySessionKey))
+    throw new Error("Prepare the LNURL payment in the selected wallet first.");
+  const response = preparedLnurl;
   preparedLnurl = null;
+  const result = await need().lnurlPay({
+    prepareResponse: response,
+    idempotencyKey: crypto.randomUUID(),
+  });
   return result;
 }
 
 export async function withdrawLnurlLive(amountSats: string) {
-  if (!parsed || parsed.type !== "lnurlWithdraw") throw new Error("Parse an LNURL-withdraw code first.");
+  if (!parsed || parsed.type !== "lnurlWithdraw")
+    throw new Error("Parse an LNURL-withdraw code first.");
   return need().lnurlWithdraw({
     amountSats: Number(asBig(amountSats, "Amount")),
     withdrawRequest: parsed,
@@ -331,7 +713,7 @@ export async function registerAddress(username: string, description: string) {
 }
 
 export async function currentAddress() {
-  return need().getLightningAddress();
+  return inSession((client) => client.getLightningAddress());
 }
 
 export async function removeAddress() {
@@ -347,10 +729,12 @@ export async function buyLive(kind: "cashApp" | "moonpay", amountSats: string) {
 }
 
 export async function loadPaymentLinkRoutes(address: string) {
-  routes = await need().getCrossChainRoutes({
-    type: "paymentLink",
-    addressDetails: { address: address.trim(), addressFamily: familyOf(address.trim()) },
-  });
+  routes = await inSession((client) =>
+    client.getCrossChainRoutes({
+      type: "paymentLink",
+      addressDetails: { address: address.trim(), addressFamily: familyOf(address.trim()) },
+    }),
+  );
   return routes;
 }
 
@@ -388,7 +772,12 @@ export async function claimDepositLive(txid: string, vout: string) {
   });
 }
 
-export async function refundDepositLive(txid: string, vout: string, destination: string, fee: string) {
+export async function refundDepositLive(
+  txid: string,
+  vout: string,
+  destination: string,
+  fee: string,
+) {
   return need().refundDeposit({
     txid: txid.trim(),
     vout: Number(vout),
@@ -404,21 +793,27 @@ export async function createTokenLive(input: {
   maxSupply: string;
   freezable: boolean;
 }) {
-  return need().getTokenIssuer().createIssuerToken({
-    name: input.name.trim(),
-    ticker: input.ticker.trim(),
-    decimals: Number(input.decimals),
-    isFreezable: input.freezable,
-    maxSupply: asBig(input.maxSupply, "Max supply"),
-  });
+  return need()
+    .getTokenIssuer()
+    .createIssuerToken({
+      name: input.name.trim(),
+      ticker: input.ticker.trim(),
+      decimals: Number(input.decimals),
+      isFreezable: input.freezable,
+      maxSupply: asBig(input.maxSupply, "Max supply"),
+    });
 }
 
 export async function mintTokenLive(amount: string) {
-  return need().getTokenIssuer().mintIssuerToken({ amount: asBig(amount, "Amount") });
+  return need()
+    .getTokenIssuer()
+    .mintIssuerToken({ amount: asBig(amount, "Amount") });
 }
 
 export async function burnTokenLive(amount: string) {
-  return need().getTokenIssuer().burnIssuerToken({ amount: asBig(amount, "Amount") });
+  return need()
+    .getTokenIssuer()
+    .burnIssuerToken({ amount: asBig(amount, "Amount") });
 }
 
 export async function freezeTokenLive(address: string, freeze: boolean) {
@@ -454,7 +849,11 @@ export async function addSdkContact(name: string, paymentIdentifier: string) {
 }
 
 export async function updateSdkContact(id: string, name: string, paymentIdentifier: string) {
-  return need().updateContact({ id: id.trim(), name: name.trim(), paymentIdentifier: paymentIdentifier.trim() });
+  return need().updateContact({
+    id: id.trim(),
+    name: name.trim(),
+    paymentIdentifier: paymentIdentifier.trim(),
+  });
 }
 
 export async function deleteSdkContact(id: string) {
@@ -539,12 +938,19 @@ export async function refundConversions() {
 }
 
 export async function prepareExit(feeRate: string, destination: string) {
-  lastExitPlan = await need().prepareUnilateralExit({
-    feeRateSatPerVbyte: Number(feeRate) || 5,
-    fundingKind: { type: "p2wpkh" },
-    destination: destination.trim(),
-    selection: { type: "auto" },
-  });
+  const generation = ++legacyQuoteGeneration;
+  lastExitPlan = null;
+  const response = await inSession((client) =>
+    client.prepareUnilateralExit({
+      feeRateSatPerVbyte: Number(feeRate) || 5,
+      fundingKind: { type: "p2wpkh" },
+      destination: destination.trim(),
+      selection: { type: "auto" },
+    }),
+  );
+  if (generation !== legacyQuoteGeneration)
+    throw new Error("Exit details changed. Prepare the exit again.");
+  lastExitPlan = response;
   return lastExitPlan;
 }
 
@@ -556,22 +962,28 @@ export async function broadcastExit(input: {
   secretHex: string;
 }) {
   if (!lastExitPlan) throw new Error("Prepare the exit first.");
+  const session = sessions.need();
+  const plan = lastExitPlan;
+  lastExitPlan = null;
   const mod = await load();
+  if (!sessions.isCurrent(session.identity.key)) throw new StaleSessionError();
   const signer = mod.singleKeyCpfpSigner(hexToBytes(input.secretHex));
-  lastExit = await need().unilateralExit(
-    {
-      prepared: lastExitPlan,
-      fundingInputs: [
-        {
-          type: "p2wpkh",
-          txid: input.txid.trim(),
-          vout: Number(input.vout),
-          value: Number(input.value),
-          pubkey: input.pubkey.trim(),
-        },
-      ],
-    },
-    signer,
+  lastExit = await inSession((client) =>
+    client.unilateralExit(
+      {
+        prepared: plan,
+        fundingInputs: [
+          {
+            type: "p2wpkh",
+            txid: input.txid.trim(),
+            vout: Number(input.vout),
+            value: Number(input.value),
+            pubkey: input.pubkey.trim(),
+          },
+        ],
+      },
+      signer,
+    ),
   );
   return lastExit;
 }
@@ -590,22 +1002,36 @@ export async function exportExit() {
 }
 
 export async function watchLive(onEvent: (event: SdkEvent) => void) {
-  const current = need();
-  if (listenerId) {
+  const session = sessions.need();
+  const current = session.client;
+  const previousListener = listeners.get(current);
+  if (previousListener) {
     try {
-      await current.removeEventListener(listenerId);
+      await current.removeEventListener(previousListener);
     } catch {
       /* replace it */
     }
   }
-  listenerId = await current.addEventListener({ onEvent });
+  const nextListener = await current.addEventListener({
+    onEvent: (event) => {
+      if (sessions.isCurrent(session.identity.key)) onEvent(event);
+    },
+  });
+  if (!sessions.isCurrent(session.identity.key)) {
+    await current.removeEventListener(nextListener).catch(() => undefined);
+    throw new StaleSessionError();
+  }
+  listeners.set(current, nextListener);
+  listenerId = nextListener;
   return listenerId;
 }
 
 export async function walletSnapshot() {
+  const session = sessions.need();
   const info = await liveInfo(false);
   const address = await currentAddress();
   const history = await listLivePayments();
+  if (!sessions.isCurrent(session.identity.key)) throw new StaleSessionError();
   const tokens = [...info.tokenBalances.entries()].map(([id, balance]) => ({
     id,
     ticker: balance.tokenMetadata.ticker,
@@ -635,30 +1061,53 @@ export async function connectTurnkey(input: {
   apiPrivateKey: string;
   walletId: string;
 }) {
-  const mod = await load();
-  const config = mod.defaultConfig(input.network);
-  const key = input.apiKey.trim();
-  if (key) config.apiKey = key;
-  else if (input.network === "mainnet") throw new Error("Mainnet needs your Breez API key.");
-  const signers = await mod.createTurnkeySigner({
-    organizationId: input.organizationId.trim(),
-    apiPublicKey: input.apiPublicKey.trim(),
-    apiPrivateKey: input.apiPrivateKey.trim(),
-    walletId: input.walletId.trim(),
+  const version = ++requestVersion;
+  opening = null;
+  await sessions.disconnect();
+  if (input.network === "mainnet" && !input.apiKey.trim())
+    throw new Error("Mainnet needs your Breez API key.");
+  const identity = await sessionIdentity({
+    mnemonic: `turnkey:${input.organizationId.trim()}:${input.walletId.trim()}:${input.apiPublicKey.trim()}`,
     network: input.network,
-    accountNumber: input.account,
+    account: input.account,
   });
-  const next = await mod.connectWithSigner(
-    config,
-    signers.breezSigner,
-    signers.sparkSigner,
-    `cpay-turnkey-${input.network}-a${input.account}`,
+  if (version !== requestVersion) throw new StaleSessionError();
+  const client = await sessions.connect(identity, () =>
+    buildSdkClient(async () => {
+      const mod = await load();
+      if (version !== requestVersion) throw new StaleSessionError();
+      const config = mod.defaultConfig(input.network);
+      if (input.apiKey.trim()) config.apiKey = input.apiKey.trim();
+      const signers = await mod.createTurnkeySigner({
+        organizationId: input.organizationId.trim(),
+        apiPublicKey: input.apiPublicKey.trim(),
+        apiPrivateKey: input.apiPrivateKey.trim(),
+        walletId: input.walletId.trim(),
+        network: input.network,
+        accountNumber: input.account,
+      });
+      const storageName = `cpay-sdk-v3-${identity.key}`;
+      rememberStorage(storageName);
+      const cacheKey = await deriveSdkCacheKey(
+        new TextEncoder().encode(input.apiPrivateKey.trim()),
+        storageName,
+      );
+      if (version !== requestVersion) throw new StaleSessionError();
+      cacheKeys.set(storageName, cacheKey);
+      return mod.connectWithSigner(config, signers.breezSigner, signers.sparkSigner, storageName);
+    }),
   );
-  await adopt(next);
-  return liveInfo(true);
+  if (version !== requestVersion || !sessions.isCurrent(identity.key))
+    throw new StaleSessionError();
+  return client.getInfo({ ensureSynced: true });
 }
 
-export async function prepareBatchLive(rows: { destination: string; amount: string; tokenIdentifier: string }[]) {
+export async function prepareBatchLive(
+  rows: { destination: string; amount: string; tokenIdentifier: string }[],
+) {
+  const session = sessions.need();
+  const generation = ++legacyQuoteGeneration;
+  preparedBatch = null;
   const recipients = rows
     .filter((row) => row.destination.trim())
     .map((row) => ({
@@ -667,14 +1116,20 @@ export async function prepareBatchLive(rows: { destination: string; amount: stri
       tokenIdentifier: row.tokenIdentifier.trim() || undefined,
     }));
   if (recipients.length === 0) throw new Error("Add a recipient.");
-  preparedBatch = await need().prepareSendBatch({ recipients });
+  const response = await inSession((client) => client.prepareSendBatch({ recipients }));
+  if (generation !== legacyQuoteGeneration)
+    throw new Error("Batch details changed. Prepare the batch again.");
+  preparedBatch = response;
+  legacySessionKey = session.identity.key;
   return preparedBatch;
 }
 
 export async function sendBatchLive() {
-  if (!preparedBatch) throw new Error("Prepare the batch first.");
-  const result = await need().sendBatch({ prepareResponse: preparedBatch });
+  if (!preparedBatch || !legacySessionKey || !sessions.isCurrent(legacySessionKey))
+    throw new Error("Prepare the batch in the selected wallet first.");
+  const response = preparedBatch;
   preparedBatch = null;
+  const result = await need().sendBatch({ prepareResponse: response });
   return result;
 }
 
@@ -683,7 +1138,9 @@ export async function claimHtlc(preimage: string) {
 }
 
 export async function conversionLimits(tokenIdentifier: string) {
-  const fromBitcoin = await need().fetchConversionLimits({ conversionType: { type: "fromBitcoin" } });
+  const fromBitcoin = await need().fetchConversionLimits({
+    conversionType: { type: "fromBitcoin" },
+  });
   const toBitcoin = tokenIdentifier.trim()
     ? await need().fetchConversionLimits({
         conversionType: { type: "toBitcoin", fromTokenIdentifier: tokenIdentifier.trim() },
@@ -693,7 +1150,9 @@ export async function conversionLimits(tokenIdentifier: string) {
 }
 
 export async function authorizeAddress(transfereePubkey: string) {
-  lastAuth = await need().authorizeLightningAddressTransfer({ transfereePubkey: transfereePubkey.trim() });
+  lastAuth = await inSession((client) =>
+    client.authorizeLightningAddressTransfer({ transfereePubkey: transfereePubkey.trim() }),
+  );
   return lastAuth;
 }
 

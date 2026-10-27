@@ -14,24 +14,31 @@ concurrency:
 
 jobs:
   verify:
-    name: Typecheck, app tests, build
-    runs-on: ubuntu-latest
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
       - run: npm ci --no-audit --no-fund
       - name: Typecheck
         run: npm run typecheck
-      - name: App tests (wallet data + sign-in gate)
-        run: >-
-          node --experimental-strip-types --test
-          src/lib/app-data/app-data.test.ts
-          src/lib/app-data/readiness-schedule.test.ts
-          src/lib/auth/gate-identity.test.ts
-          src/lib/auth/sign-in-gate.test.ts
+      - name: Tests (wallet, vault, app data, auth and build tools)
+        run: npm test
       - name: Web build (no database migration)
-        run: PATH="$PWD/node_modules/.bin:$PATH" node scripts/with-app-env.mjs vite build
+        run: npm run build:web
+      - name: Mobile web bundle
+        run: npm run build:mobile
+      - name: Install isolated browser
+        if: runner.os == 'Linux'
+        run: node node_modules/playwright/cli.js install --with-deps chromium
+      - name: Wallet browser regressions (synthetic wallets, no funds)
+        if: runner.os == 'Linux'
+        run: npm run test:browser

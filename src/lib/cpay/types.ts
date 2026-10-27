@@ -8,6 +8,9 @@ export type TokenHolding = {
 };
 
 export type Member = {
+  mode?: "practice" | "live";
+  network?: "mainnet" | "regtest";
+  account?: number;
   id: string;
   name: string;
   seed: string[];
