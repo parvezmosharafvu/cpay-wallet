@@ -1,18 +1,17 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Btn, Field, Frame, BackTitle, Logo, Toast, Line, readQr, Qr } from "./shared-ui";
+import { VaultGate, VaultSettings, SecretReveal } from "./vault-gate";
+import { LiveSendScreen, LiveReceiveScreen, LiveActivityScreen, useLiveWallet } from "./live-wallet";
 import {
   ArrowDownLeft,
-  ArrowLeft,
   ArrowLeftRight,
   ArrowUpRight,
   Banknote,
   Check,
   ChevronRight,
-  Copy,
   Home,
-  KeyRound,
   LayoutGrid,
   Receipt,
-  Users,
   Zap,
 } from "lucide-react";
 import { t, type CopyKey } from "@/lib/cpay/i18n";
@@ -37,11 +36,12 @@ import {
 import { parseInput, routesFor, type CashRoute, type Parsed } from "@/lib/cpay/parse";
 import { activeMember, useCpay } from "@/lib/cpay/store";
 import type { Lang, PayKind, Payment } from "@/lib/cpay/types";
-import { createPasskey, passkeyMessage, signInPasskey } from "@/lib/cpay/passkey";
 import { Capacitor } from "@capacitor/core";
-import { startAds } from "@/lib/cpay/ads";
+import { startAds, showAdPrivacyOptions } from "@/lib/cpay/ads";
 import { appBreezKey } from "@/lib/cpay/app-key";
-import { explain, ensureLive, isLiveConnected, liveInfo, prepareLiveSend, receiveLive, sendLive } from "@/lib/cpay/sdk";
+import { explain } from "@/lib/cpay/sdk";
+import { useBtcPrice } from "@/lib/cpay/use-btc-price";
+import { Onboarding, SeedGate, NetworkPicker } from "./onboarding";
 import { SdkScreen } from "@/components/cpay/sdk-screen";
 
 type Tab = "home" | "send" | "receive" | "activity" | "more";
@@ -91,132 +91,8 @@ function moneyLine(p: Payment) {
   return kindLabel(p.kind, "en");
 }
 
-function Logo({ size = 36 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden="true">
-      <rect width="32" height="32" rx="9" className="fill-primary" />
-      <path
-        d="M16.4 6.2 10 16.2h4.6l-1.5 9.6 8.4-11.6h-4.8l-0.3-8Z"
-        className="fill-primary-ink"
-      />
-    </svg>
-  );
-}
-
-function Btn({
-  children,
-  onClick,
-  disabled,
-  tone = "primary",
-  type = "button",
-}: {
-  children: ReactNode;
-  onClick?: () => void;
-  disabled?: boolean;
-  tone?: "primary" | "ghost" | "danger";
-  type?: "button" | "submit";
-}) {
-  const toneClass =
-    tone === "primary"
-      ? "bg-primary text-primary-ink"
-      : tone === "danger"
-        ? "bg-danger text-fg"
-        : "border border-line bg-surface text-fg";
-  return (
-    <button
-      type={type}
-      onClick={onClick}
-      disabled={disabled}
-      className={`flex h-12 w-full items-center justify-center rounded-2xl px-4 text-base font-semibold disabled:opacity-40 ${toneClass}`}
-    >
-      {children}
-    </button>
-  );
-}
-
-function Field({
-  label,
-  value,
-  onChange,
-  placeholder,
-  inputMode,
-  mono,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  placeholder?: string;
-  inputMode?: "text" | "decimal" | "numeric";
-  mono?: boolean;
-}) {
-  return (
-    <label className="block">
-      <span className="mb-2 block text-sm text-muted">{label}</span>
-      <input
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        inputMode={inputMode ?? "text"}
-        className={`h-12 w-full rounded-2xl border border-line bg-surface px-4 text-base text-fg outline-none placeholder:text-muted focus:border-primary ${mono ? "font-mono" : ""}`}
-      />
-    </label>
-  );
-}
-
-function Toast({ msg }: { msg: string | null }) {
-  if (!msg) return null;
-  return (
-    <div className="pointer-events-none fixed inset-x-0 top-3 z-30 flex justify-center px-4">
-      <p className="rounded-full border border-line bg-surface px-4 py-2 text-sm text-fg">{msg}</p>
-    </div>
-  );
-}
-
-function Frame({ children, dock }: { children: ReactNode; dock?: boolean }) {
-  return (
-    <div className="min-h-dvh bg-bg text-fg">
-      <div className={`mx-auto flex min-h-dvh w-full max-w-md flex-col px-4 ${dock ? "dock-pad" : "pb-10"}`}>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function BackTitle({ title, onBack }: { title: string; onBack: () => void }) {
-  return (
-    <header className="flex h-14 items-center gap-2">
-      <button
-        type="button"
-        onClick={onBack}
-        className="grid h-11 w-11 place-items-center rounded-2xl border border-line bg-surface"
-        aria-label="Back"
-      >
-        <ArrowLeft className="size-5" />
-      </button>
-      <h1 className="text-lg font-semibold">{title}</h1>
-    </header>
-  );
-}
-
-function AdSlot() {
-  const lang = useCpay((s) => s.lang);
-  const [i, setI] = useState(0);
-  useEffect(() => {
-    const id = window.setInterval(() => setI((n) => (n + 1) % 3), 8000);
-    return () => window.clearInterval(id);
-  }, []);
-  const lines: CopyKey[] = ["ad1", "ad2", "ad3"];
-  return (
-    <div className="flex items-center gap-3 border-t border-line px-4 py-2">
-      <span className="rounded-md bg-surface-2 px-2 py-1 text-xs font-medium text-muted">{t(lang, "adLabel")}</span>
-      <p className="min-w-0 truncate text-sm text-fg">{t(lang, lines[i])}</p>
-    </div>
-  );
-}
-
 function Dock({ tab, onTab }: { tab: Tab; onTab: (tab: Tab) => void }) {
   const lang = useCpay((s) => s.lang);
-  const showAds = useCpay((s) => s.showAds);
   const items: { id: Tab; label: CopyKey; icon: typeof Home }[] = [
     { id: "home", label: "navHome", icon: Home },
     { id: "send", label: "navSend", icon: ArrowUpRight },
@@ -227,7 +103,6 @@ function Dock({ tab, onTab }: { tab: Tab; onTab: (tab: Tab) => void }) {
   return (
     <div className="fixed inset-x-0 bottom-0 z-20">
       <div className="dock-safe mx-auto w-full max-w-md bg-bg">
-        {showAds && !Capacitor.isNativePlatform() ? <AdSlot /> : null}
         <nav className="grid grid-cols-5 border-t border-line" aria-label="Primary">
           {items.map((item) => {
             const Icon = item.icon;
@@ -251,242 +126,6 @@ function Dock({ tab, onTab }: { tab: Tab; onTab: (tab: Tab) => void }) {
   );
 }
 
-async function readQr(file: File) {
-  const bitmap = await createImageBitmap(file);
-  const canvas = document.createElement("canvas");
-  canvas.width = bitmap.width;
-  canvas.height = bitmap.height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("scan");
-  ctx.drawImage(bitmap, 0, 0);
-  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const { default: jsQR } = await import("jsqr");
-  const code = jsQR(image.data, image.width, image.height);
-  bitmap.close();
-  if (!code?.data) throw new Error("scan");
-  return code.data;
-}
-
-function Splash() {
-  return (
-    <Frame>
-      <div className="flex flex-1 flex-col items-center justify-center gap-3">
-        <Logo size={56} />
-        <p className="text-2xl font-semibold tracking-tight">CPay</p>
-      </div>
-    </Frame>
-  );
-}
-
-function Onboarding() {
-  const lang = useCpay((s) => s.lang);
-  const setLang = useCpay((s) => s.setLang);
-  const createMember = useCpay((s) => s.createMember);
-  const setSdkMnemonic = useCpay((s) => s.setSdkMnemonic);
-  const [mode, setMode] = useState<"home" | "create" | "restore">("home");
-  const [name, setName] = useState("");
-  const [words, setWords] = useState("");
-  const [err, setErr] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  async function withPasskey(kind: "create" | "signin") {
-    setBusy(true);
-    setErr(null);
-    try {
-      const label = name.trim() || "CPay";
-      const seed = kind === "create" ? await createPasskey(label) : await signInPasskey(label);
-      setSdkMnemonic(seed.join(" "));
-      const result = await createMember(label, { seed, backup: false });
-      if (!result.ok) setErr(t(lang, result.error));
-    } catch (error) {
-      setErr(t(lang, passkeyMessage(error)));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function create() {
-    setBusy(true);
-    const result = await createMember(name);
-    setBusy(false);
-    if (!result.ok) setErr(t(lang, result.error));
-  }
-
-  async function restore() {
-    setBusy(true);
-    const result = await useCpay.getState().restore(words);
-    setBusy(false);
-    if (!result.ok) setErr(t(lang, result.error));
-  }
-
-  return (
-    <Frame>
-      <header className="flex items-center justify-between pt-6">
-        <div className="flex items-center gap-3">
-          <Logo />
-          <span className="text-lg font-semibold">CPay</span>
-        </div>
-        <button
-          type="button"
-          onClick={() => setLang(lang === "en" ? "bn" : "en")}
-          className="h-11 rounded-2xl border border-line px-3 text-sm"
-        >
-          {lang === "en" ? "বাংলা" : "English"}
-        </button>
-      </header>
-
-      {mode === "home" ? (
-        <div className="flex flex-1 flex-col pt-8">
-          <p className="text-xs font-medium uppercase tracking-wide text-primary">{t(lang, "practice")}</p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-tight">{t(lang, "tagline")}</h1>
-          <ul className="mt-8 flex flex-col gap-3">
-            {[
-              { icon: KeyRound, t: "f1t" as const, d: "f1d" as const },
-              { icon: Banknote, t: "f2t" as const, d: "f2d" as const },
-              { icon: Users, t: "f3t" as const, d: "f3d" as const },
-            ].map((row) => (
-              <li key={row.t} className="flex gap-3 rounded-2xl border border-line bg-surface p-3">
-                <span className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-surface-2 text-primary">
-                  <row.icon className="size-5" />
-                </span>
-                <span>
-                  <span className="block text-base font-medium">{t(lang, row.t)}</span>
-                  <span className="mt-1 block text-sm text-muted">{t(lang, row.d)}</span>
-                </span>
-              </li>
-            ))}
-          </ul>
-          {err ? <p className="mt-4 text-sm text-danger">{err}</p> : null}
-          <div className="mt-auto flex flex-col gap-3 pt-8">
-            <Btn disabled={busy} onClick={() => void withPasskey("create")}>{busy ? t(lang, "creating") : t(lang, "passkeyCta")}</Btn>
-            <Btn tone="ghost" disabled={busy} onClick={() => void withPasskey("signin")}>{t(lang, "passkeyIn")}</Btn>
-            <Btn tone="ghost" onClick={() => { setErr(null); setMode("create"); }}>{t(lang, "createWallet")}</Btn>
-            <Btn tone="ghost" onClick={() => { setErr(null); setMode("restore"); }}>{t(lang, "restoreWallet")}</Btn>
-          </div>
-        </div>
-      ) : null}
-
-      {mode === "create" ? (
-        <form
-          className="flex flex-1 flex-col pt-6"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void create();
-          }}
-        >
-          <h1 className="text-2xl font-semibold">{t(lang, "titleCreate")}</h1>
-          <p className="mt-2 text-sm text-muted">{t(lang, "saveFirst")}</p>
-          <div className="mt-6">
-            <Field label={t(lang, "nameLabel")} value={name} onChange={setName} placeholder={t(lang, "namePh")} />
-          </div>
-          {err ? <p className="mt-3 text-sm text-danger">{err}</p> : null}
-          <div className="mt-auto flex flex-col gap-3 pt-8">
-            <Btn type="submit" disabled={busy}>{busy ? t(lang, "creating") : t(lang, "createCta")}</Btn>
-            <Btn tone="ghost" onClick={() => setMode("home")}>{t(lang, "back")}</Btn>
-          </div>
-        </form>
-      ) : null}
-
-      {mode === "restore" ? (
-        <form
-          className="flex flex-1 flex-col pt-6"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void restore();
-          }}
-        >
-          <h1 className="text-2xl font-semibold">{t(lang, "restoreH")}</h1>
-          <p className="mt-2 text-sm text-muted">{t(lang, "restoreP")}</p>
-          <label className="mt-6 block">
-            <span className="mb-2 block text-sm text-muted">{t(lang, "wordsLabel")}</span>
-            <textarea
-              value={words}
-              onChange={(e) => setWords(e.target.value)}
-              placeholder={t(lang, "placeholderSeed")}
-              className="h-32 w-full rounded-2xl border border-line bg-surface p-4 font-mono text-sm text-fg outline-none focus:border-primary"
-            />
-          </label>
-          {err ? <p className="mt-3 text-sm text-danger">{err}</p> : null}
-          <div className="mt-auto flex flex-col gap-3 pt-8">
-            <Btn type="submit" disabled={busy}>{busy ? t(lang, "restoring") : t(lang, "restoreB")}</Btn>
-            <Btn tone="ghost" onClick={() => setMode("home")}>{t(lang, "back")}</Btn>
-          </div>
-        </form>
-      ) : null}
-    </Frame>
-  );
-}
-
-function SeedGate({ memberId }: { memberId: string }) {
-  const lang = useCpay((s) => s.lang);
-  const member = useCpay((s) => s.members.find((m) => m.id === memberId));
-  const ack = useCpay((s) => s.ackBackup);
-  const [checked, setChecked] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!member) ack();
-  }, [member, ack]);
-
-  if (!member) return <Splash />;
-
-  return (
-    <Frame>
-      <header className="flex items-center gap-3 pt-6">
-        <Logo />
-        <div>
-          <p className="text-xs font-medium uppercase tracking-wide text-primary">{t(lang, "seedIs")}</p>
-          <h1 className="text-xl font-semibold">{member.name}</h1>
-        </div>
-      </header>
-      <p className="mt-4 text-sm text-muted">{t(lang, "seedBody")}</p>
-      <ol className="mt-4 grid grid-cols-2 gap-2">
-        {member.seed.map((word, i) => (
-          <li key={`${word}-${i}`} className="flex items-center gap-2 rounded-xl border border-line bg-surface px-3 py-2">
-            <span className="w-5 font-mono text-xs text-muted">{i + 1}</span>
-            <span className="font-mono text-sm">{word}</span>
-          </li>
-        ))}
-      </ol>
-      <button
-        type="button"
-        className="mt-3 flex h-11 items-center gap-2 text-sm font-medium text-primary"
-        onClick={() => {
-          void copyText(member.seed.join(" ")).then((ok) => setCopied(ok));
-        }}
-      >
-        {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
-        {copied ? t(lang, "copied") : t(lang, "copyAll")}
-      </button>
-      <p className="mt-2 text-sm text-danger">{t(lang, "notBip")}</p>
-      <label className="mt-4 flex items-start gap-3 text-sm">
-        <input
-          type="checkbox"
-          checked={checked}
-          onChange={(e) => setChecked(e.target.checked)}
-          className="mt-1 size-4 accent-primary"
-        />
-        {t(lang, "checkbox")}
-      </label>
-      {err ? <p className="mt-2 text-sm text-danger">{err}</p> : null}
-      <div className="mt-6">
-        <Btn
-          onClick={() => {
-            if (!checked) {
-              setErr(t(lang, "mustTick"));
-              return;
-            }
-            ack();
-          }}
-        >
-          {t(lang, "goIn")}
-        </Btn>
-      </div>
-    </Frame>
-  );
-}
-
 function HomeScreen({
   open,
   onTab,
@@ -504,22 +143,9 @@ function HomeScreen({
   const faucet = useCpay((s) => s.faucet);
   const [mode, setMode] = useState<"usd" | "btc">("usd");
   const [msg, setMsg] = useState<string | null>(null);
-  const [liveSats, setLiveSats] = useState<number | null>(null);
-  useEffect(() => {
-    const phrase = me?.seed.join(" ") ?? "";
-    if (!phrase) return;
-    let stop = false;
-    void ensureLive(phrase)
-      .then(async (ok) => {
-        if (!ok || stop) return;
-        const info = await liveInfo();
-        if (!stop) setLiveSats(info.balanceSats);
-      })
-      .catch(() => undefined);
-    return () => {
-      stop = true;
-    };
-  }, [me?.id, me?.seed]);
+  const liveWallet = useLiveWallet(me);
+  const live = me?.mode === "live";
+  const liveSats = liveWallet.balance;
   if (!me) return null;
   const total = satsToUsd(me.sats, btcUsd) + me.usdbCents / 100;
   const recent = payments.filter((p) => p.memberId === me.id).slice(0, 4);
@@ -547,7 +173,7 @@ function HomeScreen({
 
       <section className="mt-5 rounded-3xl border border-line bg-surface p-4">
         <div className="flex items-center justify-between">
-          <p className="text-xs font-medium uppercase tracking-wide text-primary">{liveSats != null ? t(lang, "liveBal") : t(lang, "practice")}</p>
+          <p className="text-xs font-medium uppercase tracking-wide text-primary">{live ? `${t(lang, "liveBal")} · ${me.network ?? "regtest"}` : t(lang, "practice")}</p>
           <div className="flex rounded-full border border-line p-1 text-xs">
             <button
               type="button"
@@ -566,12 +192,12 @@ function HomeScreen({
           </div>
         </div>
         <p className="mt-3 font-mono text-4xl font-medium tabular-nums tracking-tight">
-          {mode === "usd" ? formatUsd(liveSats != null ? satsToUsd(liveSats, btcUsd) : total) : formatSats(liveSats ?? me.sats)}
+          {live && liveSats === null ? "—" : mode === "usd" ? formatUsd(live ? satsToUsd(liveSats ?? 0, btcUsd) : total) : formatSats(live ? liveSats ?? 0 : me.sats)}
         </p>
         <p className="mt-1 text-sm text-muted">
           {mode === "usd"
-            ? `${formatSats(liveSats ?? me.sats)} sats`
-            : formatUsd(satsToUsd(liveSats ?? me.sats, btcUsd))}
+            ? `${live && liveSats === null ? "—" : formatSats(live ? liveSats ?? 0 : me.sats)} sats`
+            : live && liveSats === null ? "—" : formatUsd(satsToUsd(live ? liveSats ?? 0 : me.sats, btcUsd))}
         </p>
         <p className="mt-3 font-mono text-xs text-muted">
           {t(lang, "rateLabel")} {formatUsd(btcUsd)} · {priceLive ? t(lang, "liveRate") : t(lang, "practiceRate")}
@@ -581,11 +207,11 @@ function HomeScreen({
       <div className="mt-3 grid grid-cols-2 gap-2">
         <div className="rounded-2xl border border-line bg-surface px-3 py-3">
           <p className="text-xs text-muted">{t(lang, "btcBal")}</p>
-          <p className="mt-1 font-mono text-sm tabular-nums">{formatSats(liveSats ?? me.sats)} sats</p>
+          <p className="mt-1 font-mono text-sm tabular-nums">{live && liveSats === null ? "—" : formatSats(live ? liveSats ?? 0 : me.sats)} sats</p>
         </div>
         <div className="rounded-2xl border border-line bg-surface px-3 py-3">
           <p className="text-xs text-muted">{t(lang, "stableBal")}</p>
-          <p className="mt-1 font-mono text-sm tabular-nums">{formatUsd(me.usdbCents / 100)}</p>
+          <p className="mt-1 font-mono text-sm tabular-nums">{live ? "—" : formatUsd(me.usdbCents / 100)}</p>
         </div>
       </div>
 
@@ -595,7 +221,7 @@ function HomeScreen({
           { label: "navGet" as const, icon: ArrowDownLeft, go: () => onTab("receive") },
           { label: "titleCash" as const, icon: Zap, go: () => open({ name: "cash" }) },
           { label: "titleBuy" as const, icon: Banknote, go: () => open({ name: "buy" }) },
-        ].map((action) => (
+        ].filter((action) => !live || action.label === "navSend" || action.label === "navGet").map((action) => (
           <button
             key={action.label}
             type="button"
@@ -608,7 +234,7 @@ function HomeScreen({
         ))}
       </div>
 
-      {waiting.length > 0 ? (
+      {!live && waiting.length > 0 ? (
         <button
           type="button"
           onClick={() => open({ name: "claims" })}
@@ -619,6 +245,7 @@ function HomeScreen({
         </button>
       ) : null}
 
+      {live ? <><p className="mt-3 text-sm text-muted">{liveWallet.loading ? (lang === "bn" ? "লাইভ balance আসছে…" : "Loading live balance…") : ""}</p>{liveWallet.error ? <p role="alert" className="mt-2 text-sm text-danger">{liveWallet.error}</p> : null}<button type="button" onClick={liveWallet.refresh} className="min-h-11 text-sm text-primary">{lang === "bn" ? "Balance রিফ্রেশ" : "Refresh balance"}</button><LiveActivityScreen member={me} compact /></> : <>
       <div className="mt-5 flex items-center justify-between">
         <h2 className="text-base font-semibold">{t(lang, "recent")}</h2>
         <button type="button" onClick={() => onTab("activity")} className="text-sm text-primary">
@@ -628,9 +255,7 @@ function HomeScreen({
       {recent.length === 0 ? (
         <div className="mt-3 rounded-2xl border border-line bg-surface p-4">
           <p className="text-sm text-muted">{t(lang, "emptyHome")}</p>
-          {appBreezKey() ? (
-            <p className="mt-3 text-sm text-fg">{t(lang, "setKeyHelp")}</p>
-          ) : (
+          {(
           <div className="mt-3 flex flex-col gap-2">
             <Btn
               onClick={() => {
@@ -655,6 +280,7 @@ function HomeScreen({
           ))}
         </ul>
       )}
+      </>}
       <p className="mt-4 text-center text-xs text-muted">
         {members.length} {t(lang, "membersHere")}
       </p>
@@ -694,6 +320,12 @@ function parsedLocal(parsed: Parsed) {
 }
 
 function SendScreen({ openDetail }: { openDetail: (id: string) => void }) {
+  const me = useMe();
+  if (me?.mode === "live") return <LiveSendScreen key={me.id} member={me} />;
+  return <PracticeSendScreen openDetail={openDetail} />;
+}
+
+function PracticeSendScreen({ openDetail }: { openDetail: (id: string) => void }) {
   const lang = useCpay((s) => s.lang);
   const me = useMe();
   const members = useCpay((s) => s.members);
@@ -768,22 +400,6 @@ function SendScreen({ openDetail }: { openDetail: (id: string) => void }) {
   }
 
   async function pay() {
-    const live = await ensureLive(me!.seed.join(" "));
-    if (live && !localId && !stable) {
-      setBusy(true);
-      setErr(null);
-      try {
-        await prepareLiveSend({ destination: dest.trim(), amount: String(sats), tokenIdentifier: "" });
-        await sendLive(speed);
-        setPayId(null);
-        setStep("done");
-      } catch (error) {
-        setErr(explain(error));
-      } finally {
-        setBusy(false);
-      }
-      return;
-    }
     const result = stable
       ? sendStable({ destination: dest.trim(), cents: Math.round(Number(amount) * 100), note: "" })
       : sendBitcoin({
@@ -970,40 +586,13 @@ function SendScreen({ openDetail }: { openDetail: (id: string) => void }) {
   );
 }
 
-function Line({ k, v }: { k: string; v: string }) {
-  return (
-    <div className="flex items-start justify-between gap-4 border-b border-line py-2 last:border-b-0">
-      <span className="text-sm text-muted">{k}</span>
-      <span className="max-w-[60%] break-all text-right font-mono text-sm">{v}</span>
-    </div>
-  );
-}
-
-function Qr({ value }: { value: string }) {
-  const [url, setUrl] = useState<string | null>(null);
-  useEffect(() => {
-    let live = true;
-    void import("qrcode").then((mod) => {
-      const qr = mod.default;
-      return qr.toDataURL(value, {
-        margin: 1,
-        width: 280,
-        color: { dark: "#07110C", light: "#F4F4F5" },
-      });
-    }).then((next) => {
-      if (live) setUrl(next);
-    }).catch(() => {
-      if (live) setUrl(null);
-    });
-    return () => {
-      live = false;
-    };
-  }, [value]);
-  if (!url) return <div className="h-52 w-52 rounded-2xl bg-fg" />;
-  return <img src={url} alt="" className="h-52 w-52 rounded-2xl" />;
-}
-
 function ReceiveScreen({ ping }: { ping: (msg: string) => void }) {
+  const me = useMe();
+  if (me?.mode === "live") return <LiveReceiveScreen key={me.id} member={me} />;
+  return <PracticeReceiveScreen ping={ping} />;
+}
+
+function PracticeReceiveScreen({ ping }: { ping: (msg: string) => void }) {
   const lang = useCpay((s) => s.lang);
   const me = useMe();
   const rotate = useCpay((s) => s.rotateAddress);
@@ -1025,22 +614,6 @@ function ReceiveScreen({ ping }: { ping: (msg: string) => void }) {
   ];
 
   async function make() {
-    const live = await ensureLive(me!.seed.join(" "));
-    if (live && method !== "usd") {
-      try {
-        const res = await receiveLive({
-          method: method === "ln" ? "bolt11" : method === "spark" ? "spark" : "bitcoin",
-          amount: amt,
-          description: "CPay",
-          tokenIdentifier: "",
-        });
-        setReq(res.paymentRequest);
-        setErr(null);
-      } catch (error) {
-        setErr(explain(error));
-      }
-      return;
-    }
     if (method === "ln") {
       const sats = Math.round(Number(amt));
       setReq(Number.isFinite(sats) && sats > 0 ? `lnbc${sats}n1p${me!.id}` : `lnbcany1p${me!.id}`);
@@ -1151,6 +724,12 @@ function ReceiveScreen({ ping }: { ping: (msg: string) => void }) {
 }
 
 function ActivityScreen({ open }: { open: (page: Page) => void }) {
+  const me = useMe();
+  if (me?.mode === "live") return <LiveActivityScreen key={me.id} member={me} />;
+  return <PracticeActivityScreen open={open} />;
+}
+
+function PracticeActivityScreen({ open }: { open: (page: Page) => void }) {
   const lang = useCpay((s) => s.lang);
   const me = useMe();
   const payments = useCpay((s) => s.payments);
@@ -1201,6 +780,7 @@ function ActivityScreen({ open }: { open: (page: Page) => void }) {
 }
 
 function MoreScreen({ open }: { open: (page: Page) => void }) {
+  const me = useMe();
   const lang = useCpay((s) => s.lang);
   const items: { page: Page; title: CopyKey; body: CopyKey }[] = [
     { page: { name: "live" }, title: "featureLive", body: "liveBlurb" },
@@ -1219,7 +799,7 @@ function MoreScreen({ open }: { open: (page: Page) => void }) {
       <h1 className="text-2xl font-semibold">{t(lang, "moreTitle")}</h1>
       <p className="mt-1 text-sm text-muted">{t(lang, "moreLead")}</p>
       <ul className="mt-4 flex flex-col gap-2">
-        {items.map((item) => (
+        {items.filter((item) => me?.mode !== "live" || ["live", "contacts", "members", "settings"].includes(item.page.name)).map((item) => (
           <li key={item.title}>
             <button
               type="button"
@@ -1646,7 +1226,10 @@ function MembersScreen({ close, ping }: { close: () => void; ping: (m: string) =
   const addShop = useCpay((s) => s.addShop);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
-  const [reveal, setReveal] = useState<string | null>(null);
+  const [walletMode, setWalletMode] = useState<"practice" | "live">("live");
+  const [network, setNetwork] = useState<"regtest" | "mainnet">("regtest");
+  const [phrase, setPhrase] = useState("");
+  const [account, setAccount] = useState("0");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   return (
@@ -1661,7 +1244,7 @@ function MembersScreen({ close, ping }: { close: () => void; ping: (m: string) =
                 <p className="text-base font-medium">
                   {m.name} {m.id === activeId ? <span className="text-xs text-primary">{t(lang, "memActive")}</span> : null}
                 </p>
-                <p className="font-mono text-xs text-muted">{m.lightning}</p>
+                <p className="font-mono text-xs text-muted">{m.mode === "live" ? `Live · ${m.network} · Account ${m.account ?? 0}` : m.lightning}</p>
               </div>
               {m.id !== activeId ? (
                 <button type="button" className="h-11 rounded-xl bg-primary px-3 text-sm font-semibold text-primary-ink" onClick={() => { switchTo(m.id); ping(t(lang, "switched")); }}>
@@ -1670,15 +1253,14 @@ function MembersScreen({ close, ping }: { close: () => void; ping: (m: string) =
               ) : null}
             </div>
             <p className="mt-2 font-mono text-xs text-muted">
-              {formatSats(m.sats)} sats · {formatUsd(m.usdbCents / 100)}
+              {m.mode === "live" ? (lang === "bn" ? "লাইভ balance Home-এ দেখুন" : "Live balance is shown on Home") : `${formatSats(m.sats)} sats · ${formatUsd(m.usdbCents / 100)}`}
             </p>
             <div className="mt-2 flex gap-3">
-              <button type="button" className="text-sm text-primary" onClick={() => setReveal(reveal === m.id ? null : m.id)}>
-                {reveal === m.id ? t(lang, "hideSeed") : t(lang, "revealSeed")}
-              </button>
+              <SecretReveal secret={m.seed.join(" ")} lang={lang} />
               <button
                 type="button"
-                className="text-sm text-danger"
+                disabled={m.mode === "live"}
+                className="text-sm text-danger disabled:opacity-40"
                 onClick={() => {
                   const result = removeMember(m.id);
                   if (!result.ok) setErr(t(lang, result.error));
@@ -1688,9 +1270,6 @@ function MembersScreen({ close, ping }: { close: () => void; ping: (m: string) =
                 {t(lang, "memDel")}
               </button>
             </div>
-            {reveal === m.id ? (
-              <p className="mt-2 break-words font-mono text-xs text-fg">{m.seed.join(" ")}</p>
-            ) : null}
           </li>
         ))}
       </ul>
@@ -1701,14 +1280,20 @@ function MembersScreen({ close, ping }: { close: () => void; ping: (m: string) =
           onSubmit={(e) => {
             e.preventDefault();
             setBusy(true);
-            void useCpay.getState().createMember(name).then((result) => {
-              setBusy(false);
+            const state = useCpay.getState();
+            if (!/^\d+$/.test(account) || !Number.isSafeInteger(Number(account))) { setBusy(false); setErr(lang === "bn" ? "সঠিক account number দিন।" : "Enter a valid account number."); return; }
+            const action = walletMode === "live" ? state.createLiveMember(name || "CPay", phrase || undefined, network, Number(account)) : state.createMember(name);
+            void action.then((result) => {
               if (!result.ok) setErr(t(lang, result.error));
-            });
+              else { setCreating(false); setPhrase(""); }
+            }).catch((error: unknown) => setErr(explain(error))).finally(() => setBusy(false));
           }}
         >
           <Field label={t(lang, "nameLabel")} value={name} onChange={setName} />
+          <label className="block text-sm text-muted">{lang === "bn" ? "Wallet mode" : "Wallet mode"}<select value={walletMode} onChange={e=>setWalletMode(e.target.value as typeof walletMode)} className="mt-2 h-12 w-full rounded-xl border border-line bg-surface px-3"><option value="live">Live SDK</option><option value="practice">Practice</option></select></label>
+          {walletMode === "live" ? <><NetworkPicker value={network} onChange={setNetwork} lang={lang}/><Field label={lang === "bn" ? "Account number" : "Account number"} value={account} onChange={setAccount} inputMode="numeric"/><label className="block text-sm text-muted">{lang === "bn" ? "Recovery phrase (নতুন wallet হলে খালি রাখুন)" : "Recovery phrase (leave blank for a new wallet)"}<textarea value={phrase} onChange={e=>setPhrase(e.target.value)} autoComplete="off" autoCorrect="off" spellCheck={false} className="mt-2 h-24 w-full rounded-xl border border-line bg-surface p-3 font-mono text-sm"/></label></> : null}
           <Btn type="submit" disabled={busy}>{t(lang, "createGo")}</Btn>
+          <Btn tone="ghost" disabled={busy} onClick={()=>{setCreating(false);setPhrase("");}}>{t(lang,"back")}</Btn>
         </form>
       ) : (
         <div className="mt-4 flex flex-col gap-2">
@@ -1730,100 +1315,40 @@ function MembersScreen({ close, ping }: { close: () => void; ping: (m: string) =
   );
 }
 
-function SettingsScreen({ close, ping }: { close: () => void; ping: (m: string) => void }) {
+function SettingsScreen({ close, ping, price }: { close: () => void; ping: (m: string) => void; price: ReturnType<typeof useBtcPrice> }) {
   const lang = useCpay((s) => s.lang);
+  const me = useMe();
   const admobAppId = useCpay((s) => s.admobAppId);
   const admobUnitId = useCpay((s) => s.admobUnitId);
+  const apiKey = useCpay((s) => s.apiKey);
+  const setApiKey = useCpay((s) => s.setApiKey);
   const showAds = useCpay((s) => s.showAds);
   const setLang = useCpay((s) => s.setLang);
   const setAdIds = useCpay((s) => s.setAdIds);
   const setShowAds = useCpay((s) => s.setShowAds);
   const faucet = useCpay((s) => s.faucet);
-  const wipe = useCpay((s) => s.wipe);
-  const setPrice = useCpay((s) => s.setPrice);
-  const [appId, setAppId] = useState(admobAppId);
+  const [key, setKey] = useState(apiKey);
   const [unit, setUnit] = useState(admobUnitId);
-  const [askWipe, setAskWipe] = useState(false);
-  const [priceMsg, setPriceMsg] = useState<string | null>(null);
-
-  async function refreshPrice() {
-    try {
-      const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd");
-      const data = (await res.json()) as { bitcoin?: { usd?: number } };
-      const n = data.bitcoin?.usd;
-      if (typeof n === "number" && n > 1000) {
-        setPrice(n, true);
-        setPriceMsg(t(lang, "priceOk"));
-        return;
-      }
-    } catch {
-      /* practice rate stays */
-    }
-    setPriceMsg(t(lang, "priceFail"));
-  }
-
-  return (
-    <Frame>
-      <BackTitle title={t(lang, "setH")} onBack={close} />
-      <p className="text-sm text-muted">{t(lang, "setP")}</p>
-      <section className="mt-5">
-        <h2 className="text-base font-semibold">{t(lang, "apiSection")}</h2>
-        <p className="mt-1 text-sm text-muted">{t(lang, "setKeyHelp")}</p>
-      </section>
-      <section className="mt-6">
-        <h2 className="text-base font-semibold">{t(lang, "adsSection")}</h2>
-        <p className="mt-1 text-sm text-muted">{t(lang, "setAdHelp")}</p>
-        <div className="mt-3 flex flex-col gap-3">
-          <Field label={t(lang, "appHint")} value={appId} onChange={setAppId} placeholder={t(lang, "appIdPh")} mono />
-          <Field label={t(lang, "unitHint")} value={unit} onChange={setUnit} placeholder={t(lang, "unitPh")} mono />
-          <Btn onClick={() => { setAdIds(appId, unit); ping(t(lang, "idsSaved")); }}>{t(lang, "saveIds")}</Btn>
-          <Btn tone="ghost" onClick={() => setShowAds(!showAds)}>{showAds ? t(lang, "hideSlot") : t(lang, "showSlot")}</Btn>
-        </div>
-      </section>
-      <section className="mt-6">
-        <h2 className="text-base font-semibold">{t(lang, "langSection")}</h2>
-        <div className="mt-3 grid grid-cols-2 gap-2">
-          <button type="button" onClick={() => setLang("en")} className={`h-12 rounded-2xl border ${lang === "en" ? "border-primary text-primary" : "border-line"}`}>English</button>
-          <button type="button" onClick={() => setLang("bn")} className={`h-12 rounded-2xl border ${lang === "bn" ? "border-primary text-primary" : "border-line"}`}>বাংলা</button>
-        </div>
-      </section>
-      <section className="mt-6">
-        <h2 className="text-base font-semibold">{t(lang, "toolsH")}</h2>
-        <p className="mt-1 text-sm text-muted">{t(lang, "toolsLead")}</p>
-        <div className="mt-3 flex flex-col gap-2">
-          {appBreezKey() ? null : (
-            <Btn tone="ghost" onClick={() => { faucet(); ping(t(lang, "fundsAdded")); }}>{t(lang, "addB2")}</Btn>
-          )}
-          <Btn tone="ghost" onClick={() => { void refreshPrice(); }}>{t(lang, "tryPrice")}</Btn>
-          {priceMsg ? <p className="text-sm text-muted">{priceMsg}</p> : null}
-        </div>
-      </section>
-      <section className="mt-6">
-        <h2 className="text-base font-semibold">{t(lang, "aboutH")}</h2>
-        <ul className="mt-2 flex flex-col gap-2 text-sm text-muted">
-          <li>{t(lang, "about1")}</li>
-          <li>{t(lang, "about2")}</li>
-          <li>{t(lang, "about3")}</li>
-          <li>{t(lang, "about4")}</li>
-          <li>{t(lang, "about5")}</li>
-        </ul>
-      </section>
-      <section className="mt-6">
-        <h2 className="text-base font-semibold text-danger">{t(lang, "danger")}</h2>
-        <p className="mt-1 text-sm text-muted">{t(lang, "eraseBody")}</p>
-        {askWipe ? (
-          <div className="mt-3 flex flex-col gap-2">
-            <Btn tone="danger" onClick={() => wipe()}>{t(lang, "eraseYes")}</Btn>
-            <Btn tone="ghost" onClick={() => setAskWipe(false)}>{t(lang, "eraseNo")}</Btn>
-          </div>
-        ) : (
-          <div className="mt-3">
-            <Btn tone="ghost" onClick={() => setAskWipe(true)}>{t(lang, "erase")}</Btn>
-          </div>
-        )}
-      </section>
-    </Frame>
-  );
+  const c = (en: string, bn: string) => lang === "bn" ? bn : en;
+  return <Frame>
+    <BackTitle title={t(lang, "setH")} onBack={close} />
+    <VaultSettings />
+    <section className="mt-6">
+      <h2 className="font-semibold">Breez API key</h2>
+      <p className="mt-1 text-sm text-muted">{c("Saved inside the encrypted vault. Mainnet requires a valid Breez key. Regtest remains a test network.", "Encrypted vault-এ সংরক্ষিত হয়। Mainnet-এর জন্য valid Breez key দরকার। Regtest পরীক্ষার নেটওয়ার্ক।")}</p>
+      <label className="mt-3 block text-sm text-muted">API key<input className="mt-2 h-12 w-full rounded-xl border border-line bg-surface px-3 font-mono text-fg" type="password" autoComplete="off" value={key} onChange={e=>setKey(e.target.value)} /></label>
+      <div className="mt-3"><Btn onClick={()=>{setApiKey(key);setKey(key.trim());ping(c("API key saved in the vault.","API key vault-এ সংরক্ষিত হয়েছে।"));}}>{c("Save key", "Key সংরক্ষণ")}</Btn></div>
+    </section>
+    <section className="mt-6">
+      <h2 className="font-semibold">{t(lang, "adsSection")}</h2>
+      <p className="mt-1 text-sm text-muted">{c("Native AdMob app IDs belong to the Android/iOS build configuration. The banner unit below is used only in a production-enabled native build; testing is the default and consent is required.", "Native AdMob app ID Android/iOS build configuration-এ থাকে। নিচের banner unit শুধু production-enabled native build-এ ব্যবহৃত হয়; default test mode, এবং consent প্রয়োজন।")}</p>
+      <div className="mt-3 flex flex-col gap-3"><Field label={t(lang, "unitHint")} value={unit} onChange={setUnit} placeholder={t(lang, "unitPh")} mono /><Btn onClick={()=>{setAdIds(admobAppId,unit);ping(t(lang,"idsSaved"));}}>{t(lang,"saveIds")}</Btn><Btn tone="ghost" onClick={()=>setShowAds(!showAds)}>{showAds?t(lang,"hideSlot"):t(lang,"showSlot")}</Btn>{Capacitor.isNativePlatform()?<Btn tone="ghost" onClick={()=>void showAdPrivacyOptions().catch(error=>ping(explain(error)))}>{c("Ad privacy choices", "বিজ্ঞাপনের গোপনীয়তা পছন্দ")}</Btn>:null}</div>
+    </section>
+    <section className="mt-6"><h2 className="font-semibold">{t(lang,"langSection")}</h2><div className="mt-3 grid grid-cols-2 gap-2"><button type="button" onClick={()=>setLang("en")} className={`h-12 rounded-xl border ${lang === "en"?"border-primary text-primary":"border-line"}`}>English</button><button type="button" onClick={()=>setLang("bn")} className={`h-12 rounded-xl border ${lang === "bn"?"border-primary text-primary":"border-line"}`}>বাংলা</button></div></section>
+    <section className="mt-6"><h2 className="font-semibold">{c("Market price", "বাজারদর")}</h2><p className="mt-2 text-sm text-muted">{price.updatedAt?`${c("Last update", "শেষ আপডেট")}: ${new Date(price.updatedAt).toLocaleTimeString(lang === "bn"?"bn-BD":"en-US")}`:c("No fresh market quote yet.", "এখনও নতুন বাজারদর পাওয়া যায়নি।")}</p><p className="mt-1 text-sm text-muted">{price.stale?c("Estimate / stale. Fiat values are informational.", "পুরোনো / আনুমানিক দর। Fiat মান শুধু তথ্যের জন্য।"):c("CoinGecko market estimate. Not an executable conversion quote.", "CoinGecko-এর আনুমানিক বাজারদর। এটি conversion quote নয়।")}</p>{price.error?<p className="mt-1 text-sm text-danger">{price.error}</p>:null}<div className="mt-3"><Btn tone="ghost" onClick={()=>void price.refresh()}>{t(lang,"tryPrice")}</Btn></div></section>
+    {me?.mode!=="live"?<section className="mt-6"><h2 className="font-semibold">{c("Practice tools", "Practice tools")}</h2><p className="mt-1 text-sm text-muted">{t(lang,"toolsLead")}</p><div className="mt-3"><Btn tone="ghost" onClick={()=>{const result=faucet();if(result.ok)ping(t(lang,"fundsAdded"));}}>{t(lang,"addB2")}</Btn></div></section>:null}
+    <section className="mt-6"><h2 className="font-semibold">{c("Recovery and privacy", "Recovery ও গোপনীয়তা")}</h2><p className="mt-2 text-sm text-muted">{c("Account sign-in does not back up wallet keys. Keep recovery words, the network/account number, and an encrypted vault export. Password loss cannot be reset by CPay. Browser scripts can access an unlocked wallet; lock it when finished.", "Account sign-in wallet key-এর backup নয়। Recovery words, network/account number ও encrypted vault export রাখুন। Password হারালে CPay reset করতে পারে না। Wallet unlocked থাকলে browser script এটি ব্যবহার করতে পারে; কাজ শেষে lock করুন।")}</p></section>
+  </Frame>;
 }
 
 function DetailScreen({ id, close, ping }: { id: string; close: () => void; ping: (m: string) => void }) {
@@ -1876,27 +1401,16 @@ function Main() {
   const [banner, setBanner] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
   const lang = useCpay((s) => s.lang);
-  const setPrice = useCpay((s) => s.setPrice);
-
-  useEffect(() => {
-    let live = true;
-    void fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
-      .then((res) => res.json() as Promise<{ bitcoin?: { usd?: number } }>)
-      .then((data) => {
-        const n = data.bitcoin?.usd;
-        if (live && typeof n === "number" && n > 1000) setPrice(n, true);
-      })
-      .catch(() => undefined);
-    return () => {
-      live = false;
-    };
-  }, [setPrice]);
+  const me = useMe();
+  const price = useBtcPrice();
 
   const showAds = useCpay((s) => s.showAds);
+  const admobUnitId = useCpay((s) => s.admobUnitId);
 
   useEffect(() => {
-    void startAds(showAds).catch(() => undefined);
-  }, [showAds]);
+    void startAds(showAds && tab !== "send" && page === null, admobUnitId).catch(() => undefined);
+    return () => { void startAds(false).catch(() => undefined); };
+  }, [showAds, admobUnitId, tab, page]);
 
   function ping(msg: string) {
     setToast(msg);
@@ -1909,6 +1423,8 @@ function Main() {
     setTab("send");
   }
 
+  if (me?.mode === "live" && page && ["cash", "buy", "convert", "tokens", "lnurl", "claims"].includes(page.name)) return <Frame><BackTitle title={lang === "bn" ? "শুধু practice" : "Practice only"} onBack={() => setPage(null)} /><p className="text-sm text-muted">{lang === "bn" ? "এই simulation লাইভ wallet-এ ব্যবহার করা যায় না।" : "This simulation is unavailable for a live wallet."}</p></Frame>;
+
   if (page?.name === "cash") return <><Toast msg={toast} /><CashScreen close={() => setPage(null)} ping={ping} /></>;
   if (page?.name === "buy") return <><Toast msg={toast} /><BuyScreen close={() => setPage(null)} ping={ping} /></>;
   if (page?.name === "convert") return <><Toast msg={toast} /><ConvertScreen close={() => setPage(null)} ping={ping} /></>;
@@ -1917,7 +1433,7 @@ function Main() {
   if (page?.name === "claims") return <><Toast msg={toast} /><ClaimsScreen close={() => setPage(null)} ping={ping} /></>;
   if (page?.name === "contacts") return <ContactsScreen close={() => setPage(null)} useAddr={useAddr} />;
   if (page?.name === "members") return <><Toast msg={toast} /><MembersScreen close={() => setPage(null)} ping={ping} /></>;
-  if (page?.name === "settings") return <><Toast msg={toast} /><SettingsScreen close={() => setPage(null)} ping={ping} /></>;
+  if (page?.name === "settings") return <><Toast msg={toast} /><SettingsScreen close={() => setPage(null)} ping={ping} price={price} /></>;
   if (page?.name === "live") return <SdkScreen close={() => setPage(null)} />;
   if (page?.name === "detail") return <><Toast msg={toast} /><DetailScreen id={page.id} close={() => setPage(null)} ping={ping} /></>;
 
@@ -1926,7 +1442,7 @@ function Main() {
       <Toast msg={toast} />
       {banner ? (
         <div className="mt-3 flex items-start justify-between gap-3 rounded-2xl border border-line bg-surface px-3 py-2">
-          <p className="text-sm text-muted">{t(lang, "bannerBody")}</p>
+          <p className="text-sm text-muted">{me?.mode === "live" ? (lang === "bn" ? `লাইভ SDK · ${me.network} · Account ${me.account ?? 0}। Backup নিরাপদে রাখুন।` : `Live SDK · ${me.network} · Account ${me.account ?? 0}. Keep your recovery backup safe.`) : t(lang, "bannerBody")}</p>
           <button type="button" onClick={() => setBanner(false)} className="shrink-0 text-sm font-medium text-primary">
             {t(lang, "know")}
           </button>
@@ -1942,22 +1458,21 @@ function Main() {
   );
 }
 
-export function WalletApp() {
-  const [ready, setReady] = useState(false);
+function WalletContent() {
   const members = useCpay((s) => s.members);
   const pending = useCpay((s) => s.pendingBackupId);
 
   useEffect(() => {
-    void Promise.resolve(useCpay.persist.rehydrate())
-      .catch(() => undefined)
-      .finally(() => setReady(true));
     if ("serviceWorker" in navigator) {
       void navigator.serviceWorker.register("/sw.js").catch(() => undefined);
     }
   }, []);
 
-  if (!ready) return <Splash />;
   if (members.length === 0) return <Onboarding />;
   if (pending) return <SeedGate memberId={pending} />;
   return <Main />;
+}
+
+export function WalletApp() {
+  return <VaultGate><WalletContent /></VaultGate>;
 }

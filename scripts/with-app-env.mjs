@@ -65,6 +65,18 @@ export function mergeAppEnv(appEnv, processEnv) {
   return { ...appEnv, ...processEnv };
 }
 
+/** Standalone wallet builds do not require a broker login unless explicitly enabled. */
+export function commandEnvironment(root, processEnv) {
+  return mergeAppEnv({ VITE_AUTH_ENABLED: "false", ...readAppEnv(root) }, processEnv);
+}
+
+/** Run Vite's JS entrypoint directly; .bin shell shims cannot be spawned on Windows. */
+export function resolveCommand(command, args, root = projectRoot()) {
+  return command === "vite"
+    ? { command: process.execPath, args: [join(root, "node_modules/vite/bin/vite.js"), ...args] }
+    : { command, args };
+}
+
 /**
  * Translate a child's `exit` `(code, signal)` into this process's exit status.
  *
@@ -110,8 +122,9 @@ function main(argv) {
     console.error("usage: node scripts/with-app-env.mjs <command> [args…]");
     process.exit(2);
   }
-  const env = mergeAppEnv(readAppEnv(projectRoot()), process.env);
-  const child = spawn(command, args, { stdio: "inherit", env });
+  const env = commandEnvironment(projectRoot(), process.env);
+  const resolved = resolveCommand(command, args);
+  const child = spawn(resolved.command, resolved.args, { stdio: "inherit", env });
   // The dev server is long-running and is stopped by signalling this wrapper.
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => child.kill(signal));

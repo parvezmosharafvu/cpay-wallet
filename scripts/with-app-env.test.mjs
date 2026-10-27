@@ -7,10 +7,12 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import {
   APP_ENV_REL_PATH,
+  commandEnvironment,
   mergeAppEnv,
   parseAppEnv,
   projectRoot,
   readAppEnv,
+  resolveCommand,
 } from "./with-app-env.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -60,7 +62,14 @@ test("an explicit process-env override wins over the file", () => {
 });
 
 test("the template ships auth off", () => {
-  assert.deepEqual(readAppEnv(projectRoot()), { VITE_AUTH_ENABLED: "false" });
+  assert.equal(commandEnvironment(makeWorkspace(), {}).VITE_AUTH_ENABLED, "false");
+  assert.equal(commandEnvironment(makeWorkspace(), { VITE_AUTH_ENABLED: "true" }).VITE_AUTH_ENABLED, "true");
+});
+
+test("Vite starts with the current Node binary instead of a platform shell shim", () => {
+  const resolved = resolveCommand("vite", ["build"]);
+  assert.equal(resolved.command, process.execPath);
+  assert.deepEqual(resolved.args, [join(projectRoot(), "node_modules/vite/bin/vite.js"), "build"]);
 });
 
 test("vite loadEnv resolves the wrapped value", () => {
@@ -117,7 +126,7 @@ test("the CLI still runs when invoked through a symlinked path", async () => {
   // node realpaths import.meta.url but not process.argv[1], so a raw comparison
   // turns the wrapper into a no-op that exits 0 without starting anything.
   const link = join(mkdtempSync(join(tmpdir(), "app-env-link-")), "scripts");
-  symlinkSync(join(projectRoot(), "scripts"), link);
+  symlinkSync(join(projectRoot(), "scripts"), link, process.platform === "win32" ? "junction" : "dir");
   const { stdout } = await execFileAsync(process.execPath, [
     join(link, "with-app-env.mjs"),
     process.execPath,

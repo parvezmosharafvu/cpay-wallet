@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { generateMnemonic, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 import { ArrowLeft } from "lucide-react";
@@ -42,6 +42,7 @@ import {
   freezeTokenLive,
   getLivePayment,
   isLiveConnected,
+  invalidateLiveQuotes,
   issuerState,
   listDeposits,
   listHooks,
@@ -82,6 +83,7 @@ import {
 } from "@/lib/cpay/sdk";
 import { copyText } from "@/lib/cpay/money";
 import { useCpay } from "@/lib/cpay/store";
+import { SecretReveal } from "./vault-gate";
 
 const SECTIONS = [
   "wallet",
@@ -102,7 +104,8 @@ type Section = (typeof SECTIONS)[number];
 
 export function SdkScreen({ close }: { close: () => void }) {
   const lang = useCpay((s) => s.lang);
-  const apiKey = appBreezKey();
+  const storedKey = useCpay((s) => s.apiKey);
+  const apiKey = storedKey || appBreezKey();
   const mnemonic = useCpay((s) => s.sdkMnemonic);
   const network = useCpay((s) => s.sdkNetwork);
   const account = useCpay((s) => s.sdkAccount);
@@ -127,8 +130,12 @@ export function SdkScreen({ close }: { close: () => void }) {
   }
 
   useEffect(() => {
-    if (!validateMnemonic(mnemonic, wordlist)) return;
-    if (network === "mainnet" && !apiKey.trim()) return;
+    invalidateLiveQuotes();
+    setConnected(false); setSats(null); setBolt(""); setOpenUrl("");
+    if (!validateMnemonic(mnemonic, wordlist) || (network === "mainnet" && !apiKey.trim())) {
+      void disconnectLive().catch(() => undefined);
+      return;
+    }
     let cancel = false;
     setBusy(true);
     void connectLive({ mnemonic, apiKey, network, account })
@@ -150,11 +157,15 @@ export function SdkScreen({ close }: { close: () => void }) {
       });
     return () => {
       cancel = true;
+      invalidateLiveQuotes();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mnemonic, network, account, apiKey]);
 
+  const running = useRef(false);
   async function run(task: () => Promise<unknown>) {
+    if (running.current) return;
+    running.current = true;
     setBusy(true);
     try {
       const value = await task();
@@ -169,6 +180,7 @@ export function SdkScreen({ close }: { close: () => void }) {
     } catch (error) {
       setOutput(explain(error));
     } finally {
+      running.current = false;
       setBusy(false);
     }
   }
@@ -187,7 +199,8 @@ export function SdkScreen({ close }: { close: () => void }) {
           </button>
           <h1 className="text-lg font-semibold">{t("title")}</h1>
         </header>
-        <p className="text-sm text-muted">{t("warn")}</p>
+        <p className="text-sm font-semibold text-danger">{lang === "bn" ? "Advanced SDK tools · এই কাজগুলো নির্বাচিত SDK wallet-এ সরাসরি প্রভাব ফেলে।" : "Advanced SDK tools · These actions directly affect the connected SDK wallet."}</p>
+        <p className="mt-2 text-sm text-muted">{t("warn")}</p>
         <p className={`mt-2 text-sm font-medium ${connected ? "text-primary" : "text-muted"}`}>
           {connected ? t("connected") : t("offline")}
           {network === "mainnet" ? " · mainnet" : " · regtest"}
@@ -380,11 +393,14 @@ function WalletPane({
   const [pub, setPub] = useState("");
   const [priv, setPriv] = useState("");
   const [walletId, setWalletId] = useState("");
+  const [importWords, setImportWords] = useState("");
+  const lang = useCpay((s) => s.lang);
   return (
     <>
-      <Field label={t("seed")} value={showSeed ? mnemonic : mnemonic ? "•••• •••• ••••" : ""} onChange={onMnemonic} mono locked={!showSeed && Boolean(mnemonic)} />
+      {mnemonic ? <SecretReveal secret={mnemonic} lang={lang} label={t("seed")} /> : null}
+      <Field label={lang === "bn" ? "SDK recovery phrase import" : "Import an SDK recovery phrase"} value={importWords} onChange={setImportWords} mono />
+      <Btn ghost disabled={busy || !validateMnemonic(importWords, wordlist)} onClick={() => { onMnemonic(importWords); setImportWords(""); }}>{lang === "bn" ? "এই phrase ব্যবহার করুন" : "Use this phrase"}</Btn>
       <Row>
-        <Btn ghost onClick={onShow}>{showSeed ? t("hide") : t("show")}</Btn>
         <Btn
           ghost
           onClick={() => {
@@ -460,6 +476,10 @@ function SendPane({ t, busy, onRun }: Pane) {
   const [speed, setSpeed] = useState<"slow" | "medium" | "fast">("medium");
   const [second, setSecond] = useState("");
   const [secondAmount, setSecondAmount] = useState("");
+  const [singleReady, setSingleReady] = useState(false);
+  const [batchReady, setBatchReady] = useState(false);
+  const epoch = useRef(0);
+  useEffect(() => { epoch.current++; setSingleReady(false); setBatchReady(false); invalidateLiveQuotes(); }, [destination, amount, tokenIdentifier, speed, second, secondAmount]);
   return (
     <>
       <Field label={t("destination")} value={destination} onChange={setDestination} mono />
@@ -478,9 +498,9 @@ function SendPane({ t, busy, onRun }: Pane) {
         ))}
       </div>
       <Btn disabled={busy} onClick={() => void onRun(() => parseLive(destination))}>{t("parse")}</Btn>
-      <Btn disabled={busy} onClick={() => void onRun(() => prepareLiveSend({ destination, amount, tokenIdentifier }))}>{t("prepare")}</Btn>
+      <Btn disabled={busy} onClick={() => { const current = epoch.current; void onRun(async () => { const value = await prepareLiveSend({ destination, amount, tokenIdentifier }); if (current === epoch.current) setSingleReady(true); return value; }); }}>{t("prepare")}</Btn>
       <Row>
-        <Btn disabled={busy} onClick={() => void onRun(() => sendLive(speed))}>{t("pay")}</Btn>
+        <Btn disabled={busy || !singleReady} onClick={() => {setSingleReady(false); void onRun(() => sendLive(speed));}}>{t("pay")}</Btn>
         <Btn ghost disabled={busy} onClick={() => void onRun(buildUnsignedLive)}>{t("unsigned")}</Btn>
       </Row>
       <Field label={t("destination")} value={second} onChange={setSecond} mono />
@@ -489,17 +509,20 @@ function SendPane({ t, busy, onRun }: Pane) {
         ghost
         disabled={busy}
         onClick={() =>
-          void onRun(() =>
-            prepareBatchLive([
+          void onRun(async () => {
+            const current = epoch.current;
+            const value = await prepareBatchLive([
               { destination, amount, tokenIdentifier },
               { destination: second, amount: secondAmount, tokenIdentifier },
-            ]),
-          )
+            ]);
+            if (current === epoch.current) setBatchReady(true);
+            return value;
+          })
         }
       >
         {t("prepare")}
       </Btn>
-      <Btn disabled={busy} onClick={() => void onRun(sendBatchLive)}>{t("batch")}</Btn>
+      <Btn disabled={busy || !batchReady} onClick={() => {setBatchReady(false); void onRun(sendBatchLive);}}>{t("batch")}</Btn>
     </>
   );
 }
@@ -539,15 +562,18 @@ function LnurlPane({ t, busy, onRun }: Pane) {
   const [input, setInput] = useState("");
   const [amount, setAmount] = useState("");
   const [comment, setComment] = useState("");
+  const [ready, setReady] = useState(false);
+  const epoch = useRef(0);
+  useEffect(() => {epoch.current++;setReady(false);invalidateLiveQuotes();}, [input, amount, comment]);
   return (
     <>
       <Field label="LNURL" value={input} onChange={setInput} mono />
       <Field label={t("amount")} value={amount} onChange={setAmount} mono />
       <Field label={t("comment")} value={comment} onChange={setComment} />
       <Btn disabled={busy} onClick={() => void onRun(() => parseLive(input))}>{t("parse")}</Btn>
-      <Btn disabled={busy} onClick={() => void onRun(() => prepareLnurlLive(amount, comment))}>{t("prepare")}</Btn>
+      <Btn disabled={busy} onClick={() => {const current=epoch.current;void onRun(async()=>{const value=await prepareLnurlLive(amount, comment);if(current===epoch.current)setReady(true);return value;});}}>{t("prepare")}</Btn>
       <Row>
-        <Btn disabled={busy} onClick={() => void onRun(payLnurlLive)}>{t("pay")}</Btn>
+        <Btn disabled={busy || !ready} onClick={() => {setReady(false);void onRun(payLnurlLive);}}>{t("pay")}</Btn>
         <Btn ghost disabled={busy} onClick={() => void onRun(() => withdrawLnurlLive(amount))}>{t("withdraw")}</Btn>
       </Row>
       <Btn ghost disabled={busy} onClick={() => void onRun(authLnurlLive)}>{t("auth")}</Btn>
