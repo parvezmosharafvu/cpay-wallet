@@ -1,0 +1,129 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main, build/android-apk]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish verified signed CPay 1.5 as the latest GitHub release
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+      artifact-name: ${{ steps.package.outputs.artifact-name }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+          cache-dependency-path: |
+            android/**/*.gradle
+            android/gradle/wrapper/gradle-wrapper.properties
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - name: Build current mobile assets
+        env:
+          VITE_AUTH_ENABLED: "false"
+          VITE_GROK_EXTENSIONS: "0"
+          VITE_BREEZ_API_KEY: ${{ secrets.VITE_BREEZ_API_KEY }}
+        run: npm run build:mobile
+      - name: Sync Android native project
+        run: node node_modules/@capacitor/cli/bin/capacitor sync android
+      - name: Install Android SDK 36 tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+          log-accepted-android-sdk-licenses: false
+      - name: Prepare original release signing key when configured
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PUBLISH: ${{ inputs.publish || false }}
+        run: node scripts/prepare-android-signing.mjs
+      - name: Build native release APK
+        working-directory: android
+        run: ./gradlew --no-daemon assembleRelease
+      - name: Verify and package APK
+        id: package
+        env:
+          APK_SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          mkdir -p apk-output
+          if [ "$APK_SIGNED" = true ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk apk-output/CPay.apk
+            echo 'artifact-name=CPay-1.5-signed' >> "$GITHUB_OUTPUT"
+          else
+            cp android/app/build/outputs/apk/release/app-release-unsigned.apk apk-output/CPay-1.5-unsigned.apk
+            echo 'artifact-name=CPay-1.5-unsigned' >> "$GITHUB_OUTPUT"
+          fi
+          node scripts/verify-android-apk.mjs apk-output/*.apk
+          (cd apk-output && sha256sum *.apk > SHA256SUMS.txt)
+      - name: Upload verified APK and metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact-name }}
+          path: apk-output/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove signing material from runner
+        if: always()
+        run: rm -f android/keystore.properties "$RUNNER_TEMP/cpay-release.jks"
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main' && needs.build.outputs.signed == 'true'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: apk-output
+      - name: Publish only the verified matching-signer APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json
+          report=json.load(open('apk-output/apk-metadata.json'))
+          assert report['signed'] is True and report['installableUpdate'] is True
+          assert report['sourceCommit'] == __import__('os').environ['GITHUB_SHA']
+          assert report['signerSha256'] == '79BB30EFCD41E2035FD09E3E84E3B21A1DBCD63A3B4DC08C2541CD15F223AE3C'
+          PY
+          (cd apk-output && sha256sum --check SHA256SUMS.txt)
+          tag=v1.5.0-android
+          existing_tag=$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}")
+          if [ -n "$existing_tag" ]; then
+            echo 'Release tag already exists; inspect its target instead of reusing it.' >&2
+            exit 1
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo 'Release already exists; inspect it instead of overwriting APK assets.' >&2
+            exit 1
+          fi
+          gh release create "$tag" --draft --target "$GITHUB_SHA" --title 'CPay 1.5 — encrypted wallet vault' --notes-file docs/android-release-notes.md
+          gh release upload "$tag" apk-output/CPay.apk apk-output/SHA256SUMS.txt apk-output/apk-metadata.json
+          gh release edit "$tag" --draft=false --latest
