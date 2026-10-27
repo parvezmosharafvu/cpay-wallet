@@ -109,6 +109,106 @@ test("password rotation retains data; only the new password unlocks the current 
   await v.unlock("another strong vault password");
   assert.equal(await v.read(), snapshot);
 });
+
+test("password rotation serializes concurrent snapshots and writes them under the new key", async (t) => {
+  const v = new WalletVault(storage());
+  await v.create(password);
+  await v.write(snapshot);
+  const latest = JSON.stringify({
+    version: 0,
+    state: { members: [], sdkMnemonic: "rotation-latest" },
+  });
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const originalDerive = crypto.subtle.deriveKey.bind(crypto.subtle);
+  const originalEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+  let holdFirstDerivation = true;
+  let latestEncryptionStarted = false;
+  t.mock.method(
+    crypto.subtle,
+    "deriveKey",
+    async (...args: Parameters<SubtleCrypto["deriveKey"]>) => {
+      if (holdFirstDerivation) {
+        holdFirstDerivation = false;
+        enter();
+        await blocked;
+      }
+      return originalDerive(...args);
+    },
+  );
+  t.mock.method(crypto.subtle, "encrypt", async (...args: Parameters<SubtleCrypto["encrypt"]>) => {
+    if (new TextDecoder().decode(args[2]).includes("rotation-latest"))
+      latestEncryptionStarted = true;
+    return originalEncrypt(...args);
+  });
+  const rotating = v.changePassword(password, "another strong vault password");
+  let writing: Promise<void> | undefined;
+  try {
+    await entered;
+    writing = v.write(latest);
+    // The write's queue continuation would run in this turn if rotation did
+    // not own the queue. No timing-dependent crypto completion is required.
+    await Promise.resolve();
+    assert.equal(latestEncryptionStarted, false);
+    release();
+    await Promise.all([rotating, writing]);
+    await v.flush();
+    assert.equal(latestEncryptionStarted, true);
+    assert.equal(await v.read(), latest);
+    v.lock();
+    await assert.rejects(v.unlock(password), /Wrong password/);
+    await v.unlock("another strong vault password");
+    assert.equal(await v.read(), latest);
+  } finally {
+    release();
+    await Promise.allSettled([rotating, ...(writing ? [writing] : [])]);
+  }
+});
+
+test("lock cancels rotation and snapshots queued behind it without recreating erased secrets", async (t) => {
+  const disk = storage(),
+    v = new WalletVault(disk);
+  await v.create(password);
+  await v.write(snapshot);
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const originalDerive = crypto.subtle.deriveKey.bind(crypto.subtle);
+  t.mock.method(
+    crypto.subtle,
+    "deriveKey",
+    async (...args: Parameters<SubtleCrypto["deriveKey"]>) => {
+      enter();
+      await blocked;
+      return originalDerive(...args);
+    },
+  );
+  const rotating = v.changePassword(password, "another strong vault password");
+  let writing: Promise<void> | undefined;
+  try {
+    await entered;
+    writing = v.write(snapshot);
+    const rejected = assert.rejects(rotating, /locked or changed/);
+    v.destroy();
+    release();
+    await Promise.all([rejected, writing]);
+    assert.equal(v.isUnlocked(), false);
+    assert.equal(disk.getItem(VAULT_KEY), null);
+    assert.equal(disk.getItem(LEGACY_KEY), null);
+  } finally {
+    release();
+    await Promise.allSettled([rotating, ...(writing ? [writing] : [])]);
+  }
+});
 test("short passwords never replace an existing backup", async () => {
   const v = new WalletVault(storage());
   await assert.rejects(v.create("short"), /12 characters/);

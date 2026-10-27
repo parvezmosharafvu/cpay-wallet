@@ -13,6 +13,7 @@ import type {
   UnilateralExitResponse,
 } from "@breeztech/breez-sdk-spark/web";
 import { appBreezKey } from "./app-key";
+import { walletAuthorization } from "./browser-vault";
 import { mnemonicToEntropy, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 import {
@@ -52,15 +53,16 @@ let legacySessionKey: string | null = null;
 let legacyQuoteGeneration = 0;
 let requestVersion = 0;
 let activeFingerprint = "";
+let sessionAuthorization: number | null = null;
 let opening: {
   fingerprint: string;
   promise: Promise<Awaited<ReturnType<BreezSdk["getInfo"]>>>;
 } | null = null;
 
-function clearPrepared() {
+function clearPrepared(preserveParsed = false) {
   prepared = null;
   preparedLnurl = null;
-  parsed = null;
+  if (!preserveParsed) parsed = null;
   preparedBatch = null;
   lastExitPlan = null;
   lastExit = null;
@@ -111,6 +113,7 @@ const sessions = new LiveSession<BreezSdk>(
   },
   () => {
     activeFingerprint = "";
+    sessionAuthorization = null;
     cacheKeys.clear();
     clearPrepared();
   },
@@ -119,25 +122,25 @@ const sessions = new LiveSession<BreezSdk>(
 type QuotedSdkResponse =
   | { type: "send"; response: PrepareSendPaymentResponse }
   | { type: "lnurl"; response: PrepareLnurlPayResponse };
-const quotes = new QuoteBook<QuotedSdkResponse>((key) => sessions.isCurrent(key));
+const quotes = new QuoteBook<QuotedSdkResponse>((key) => isSessionCurrent(key));
 
 export type LiveNetwork = Extract<Network, "mainnet" | "regtest">;
 
 export function isLiveConnected() {
-  return sessions.current() !== null;
+  return walletAuthorization.isCurrent(sessionAuthorization) && sessions.current() !== null;
 }
 
 export function currentLiveSession(): SessionIdentity | null {
-  return sessions.current()?.identity ?? null;
+  return isLiveConnected() ? (sessions.current()?.identity ?? null) : null;
 }
 
 export function isSessionCurrent(key: string) {
-  return sessions.isCurrent(key);
+  return walletAuthorization.isCurrent(sessionAuthorization) && sessions.isCurrent(key);
 }
 export { sessionIdentity as sessionKeyFor } from "./live-session";
 
-export function invalidateLiveQuotes() {
-  clearPrepared();
+export function invalidateLiveQuotes(options: { preserveParsed?: boolean } = {}) {
+  clearPrepared(options.preserveParsed === true);
 }
 
 function browserOnly() {
@@ -215,12 +218,18 @@ async function load(): Promise<SdkModule> {
 let routes: CrossChainRoutePair[] = [];
 
 function need() {
+  if (sessionAuthorization === null)
+    throw new Error("Unlock and connect the selected live wallet.");
+  walletAuthorization.assert(sessionAuthorization);
   return sessions.need().client;
 }
 
 async function inSession<T>(task: (client: BreezSdk) => Promise<T>): Promise<T> {
+  const permission = walletAuthorization.capture();
   const session = sessions.need();
+  need();
   const result = await task(session.client);
+  walletAuthorization.assert(permission);
   if (!sessions.isCurrent(session.identity.key)) throw new StaleSessionError();
   return result;
 }
@@ -269,6 +278,7 @@ export type LiveConnection = {
 };
 
 export function connectLive(input: LiveConnection) {
+  const permission = walletAuthorization.capture();
   const normalized = {
     ...input,
     mnemonic: normalizeMnemonic(input.mnemonic),
@@ -292,10 +302,12 @@ export function connectLive(input: LiveConnection) {
       throw new Error("Mainnet needs a Breez API key. Add it in Settings.");
     }
     const identity = await sessionIdentity(normalized);
+    walletAuthorization.assert(permission);
     if (version !== requestVersion) throw new StaleSessionError();
     const client = await sessions.connect(identity, () =>
       buildSdkClient(async () => {
         const mod = await load();
+        walletAuthorization.assert(permission);
         if (version !== requestVersion) throw new StaleSessionError();
         const config = mod.defaultConfig(normalized.network);
         if (normalized.apiKey) config.apiKey = normalized.apiKey;
@@ -310,20 +322,25 @@ export function connectLive(input: LiveConnection) {
           mnemonicToEntropy(normalized.mnemonic, wordlist),
           storageName,
         );
+        walletAuthorization.assert(permission);
         if (version !== requestVersion) throw new StaleSessionError();
         cacheKeys.set(storageName, cacheKey);
         builder = await builder.withDefaultStorage(storageName);
+        walletAuthorization.assert(permission);
         return builder.build();
       }),
     );
     if (version !== requestVersion || !sessions.isCurrent(identity.key))
       throw new StaleSessionError();
+    walletAuthorization.assert(permission);
+    sessionAuthorization = permission;
     activeFingerprint = fingerprint;
     const info = await client.getInfo({
       ensureSynced: !active || active.identity.key !== identity.key,
     });
     if (version !== requestVersion || !sessions.isCurrent(identity.key))
       throw new StaleSessionError();
+    walletAuthorization.assert(permission);
     return info;
   })();
   opening = { fingerprint, promise };
@@ -527,8 +544,10 @@ export async function prepareLiveQuote(input: {
 }
 
 export function executeLiveQuote(id: string): Promise<LivePayment> {
+  const permission = walletAuthorization.capture();
   return quotes.execute(id, async (item, quote) => {
-    const client = sessions.need().client;
+    walletAuthorization.assert(permission);
+    const client = need();
     const result =
       item.type === "lnurl"
         ? await client.lnurlPay({ prepareResponse: item.response, idempotencyKey: quote.id })
@@ -543,6 +562,7 @@ export function executeLiveQuote(id: string): Promise<LivePayment> {
             idempotencyKey: quote.id,
           });
     // A pending/failed response must never be turned into a success receipt.
+    walletAuthorization.assert(permission);
     return normalizePayment(result.payment);
   });
 }
@@ -1061,9 +1081,11 @@ export async function connectTurnkey(input: {
   apiPrivateKey: string;
   walletId: string;
 }) {
+  const permission = walletAuthorization.capture();
   const version = ++requestVersion;
   opening = null;
   await sessions.disconnect();
+  walletAuthorization.assert(permission);
   if (input.network === "mainnet" && !input.apiKey.trim())
     throw new Error("Mainnet needs your Breez API key.");
   const identity = await sessionIdentity({
@@ -1071,6 +1093,7 @@ export async function connectTurnkey(input: {
     network: input.network,
     account: input.account,
   });
+  walletAuthorization.assert(permission);
   if (version !== requestVersion) throw new StaleSessionError();
   const client = await sessions.connect(identity, () =>
     buildSdkClient(async () => {
@@ -1086,6 +1109,7 @@ export async function connectTurnkey(input: {
         network: input.network,
         accountNumber: input.account,
       });
+      walletAuthorization.assert(permission);
       const storageName = `cpay-sdk-v3-${identity.key}`;
       rememberStorage(storageName);
       const cacheKey = await deriveSdkCacheKey(
@@ -1099,7 +1123,13 @@ export async function connectTurnkey(input: {
   );
   if (version !== requestVersion || !sessions.isCurrent(identity.key))
     throw new StaleSessionError();
-  return client.getInfo({ ensureSynced: true });
+  walletAuthorization.assert(permission);
+  sessionAuthorization = permission;
+  const info = await client.getInfo({ ensureSynced: true });
+  walletAuthorization.assert(permission);
+  if (version !== requestVersion || !sessions.isCurrent(identity.key))
+    throw new StaleSessionError();
+  return info;
 }
 
 export async function prepareBatchLive(

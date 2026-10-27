@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { generateMnemonic, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
-import { browserVault, encryptedWalletStorage } from "./browser-vault.ts";
+import { encryptedWalletStorage, walletAuthorization } from "./browser-vault.ts";
 import { createJSONStorage, persist } from "zustand/middleware";
 import type { CopyKey } from "./i18n";
 import {
@@ -202,7 +202,8 @@ export function sanitizeWalletData(value: unknown): Partial<CpayData> {
       );
       return {
         id: id(member.id, "wallet ID"),
-        name: id(member.name, "wallet name"),
+        // Existing versions accepted longer display names; do not strand their recovery keys.
+        name: string(member.name, "wallet name"),
         seed: [...seed],
         spark: string(member.spark, "Spark address", ""),
         lightning: string(member.lightning, "Lightning address", ""),
@@ -280,7 +281,7 @@ export function sanitizeWalletData(value: unknown): Partial<CpayData> {
       const contact = record(item, "contact");
       return {
         id: id(contact.id, "contact ID"),
-        name: id(contact.name, "contact name"),
+      name: string(contact.name, "contact name"),
         address: string(contact.address, "contact address"),
       };
     }),
@@ -336,8 +337,11 @@ export function sanitizeWalletData(value: unknown): Partial<CpayData> {
 }
 
 function requireUnlockedWallet() {
-  if (typeof window !== "undefined" && !browserVault().isUnlocked())
-    throw new Error("Unlock the wallet before changing recovery data.");
+  return typeof window !== "undefined" ? walletAuthorization.capture() : undefined;
+}
+
+function assertWalletAuthorization(ticket: ReturnType<typeof requireUnlockedWallet>) {
+  if (ticket !== undefined) walletAuthorization.assert(ticket);
 }
 
 function pushPay(list: Payment[], payment: Payment): Payment[] {
@@ -370,18 +374,20 @@ export const useCpay = create<CpayStore>()(
       ...EMPTY,
 
       async createMember(name, extra) {
-        requireUnlockedWallet();
+        const authorization = requireUnlockedWallet();
         if (extra?.mode === "live") return get().createLiveMember(name, extra.seed?.join(" "));
         const clean = name.trim().replace(/\s+/g, " ");
         if (clean.length < 2) return { ok: false, error: "nameTooShort" };
+        if (clean.length > 256) return { ok: false, error: "failed" };
         const id = uid();
         const seed = extra?.seed ?? randomSeed();
         const ids = await identities(clean, seed, id);
-        requireUnlockedWallet();
+        assertWalletAuthorization(authorization);
         const member: Member = {
           id,
           name: clean,
           seed,
+          mode: "practice",
           ...ids,
           sats: extra?.sats ?? 0,
           usdbCents: extra?.cents ?? 0,
@@ -407,6 +413,9 @@ export const useCpay = create<CpayStore>()(
         requireUnlockedWallet();
         const clean = name.trim().replace(/\s+/g, " ");
         if (clean.length < 2) return { ok: false, error: "nameTooShort" };
+        if (clean.length > 256) return { ok: false, error: "failed" };
+        if (network !== "mainnet" && network !== "regtest")
+          return { ok: false, error: "failed" };
         const phrase = (mnemonic ?? generateMnemonic(wordlist, 128))
           .trim()
           .toLowerCase()
@@ -551,14 +560,18 @@ export const useCpay = create<CpayStore>()(
       },
 
       setLang(lang) {
+        if (lang !== "en" && lang !== "bn") return;
         set({ lang });
       },
 
       setApiKey(apiKey) {
-        set({ apiKey: apiKey.trim() });
+        const clean = apiKey.trim();
+        if (clean.length > 65_536) return;
+        set({ apiKey: clean });
       },
 
       setAdIds(appId, unitId) {
+        if (appId.trim().length > 65_536 || unitId.trim().length > 65_536) return;
         set({ admobAppId: appId.trim(), admobUnitId: unitId.trim() });
       },
 
@@ -567,24 +580,31 @@ export const useCpay = create<CpayStore>()(
       },
 
       setPrice(btcUsd, live) {
+        if (!Number.isFinite(btcUsd) || btcUsd <= 0 || btcUsd > Number.MAX_SAFE_INTEGER) return;
         set({ btcUsd, priceLive: live });
       },
 
       setPrefill(prefill) {
+        if (prefill.length > 65_536) return;
         set({ prefill });
       },
 
       setSdkMnemonic(sdkMnemonic) {
         requireUnlockedWallet();
-        set({ sdkMnemonic: sdkMnemonic.trim().replace(/\s+/g, " ") });
+        const clean = sdkMnemonic.trim().replace(/\s+/g, " ");
+        if (clean.length > 65_536) return;
+        set({ sdkMnemonic: clean });
       },
 
       setSdkNetwork(sdkNetwork) {
+        if (sdkNetwork !== "mainnet" && sdkNetwork !== "regtest") return;
         set({ sdkNetwork });
       },
 
       setSdkAccount(sdkAccount) {
-        set({ sdkAccount: Number.isFinite(sdkAccount) ? Math.max(0, Math.floor(sdkAccount)) : 0 });
+        const account = Math.floor(sdkAccount);
+        if (!Number.isSafeInteger(account) || account < 0 || account > 2_147_483_647) return;
+        set({ sdkAccount: account });
       },
 
       async rotateAddress() {
@@ -1054,6 +1074,8 @@ export const useCpay = create<CpayStore>()(
         const cleanName = name.trim();
         const cleanAddr = address.trim();
         if (cleanName.length < 2 || cleanAddr.length < 4) return { ok: false, error: "needBoth" };
+        if (cleanName.length > 256 || cleanAddr.length > 65_536)
+          return { ok: false, error: "failed" };
         if (get().contacts.some((c) => c.address.toLowerCase() === cleanAddr.toLowerCase())) {
           return { ok: false, error: "dupContact" };
         }

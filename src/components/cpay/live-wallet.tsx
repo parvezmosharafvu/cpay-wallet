@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDownLeft, ArrowUpRight, Check, Clock, X } from "lucide-react";
+import { walletAuthorization } from "@/lib/cpay/browser-vault";
 import { appBreezKey } from "@/lib/cpay/app-key";
 import { copyText, formatSats, formatUsd, satsToUsd, type Speed } from "@/lib/cpay/money";
 import { useCpay } from "@/lib/cpay/store";
@@ -34,6 +35,20 @@ export function liveOptions(member: Member, apiKey: string) {
   };
 }
 
+/** Re-read selection after async boundaries: a captured seed is not permission to reopen a locked wallet. */
+function isSelectedWallet(member: Member, apiKey: string) {
+  const state = useCpay.getState();
+  const selected = state.members.find((entry) => entry.id === state.activeId);
+  return (
+    state.activeId === member.id &&
+    state.apiKey === apiKey &&
+    selected?.mode === "live" &&
+    selected.network === member.network &&
+    selected.account === member.account &&
+    selected.seed.join(" ") === member.seed.join(" ")
+  );
+}
+
 /** A snapshot is visible only for the selected wallet. Errors never switch modes. */
 export function useLiveWallet(member: Member | null | undefined) {
   const apiKey = useCpay((s) => s.apiKey);
@@ -62,17 +77,25 @@ export function useLiveWallet(member: Member | null | undefined) {
       running = true;
       setLoading(true);
       try {
+        const authorization = walletAuthorization.capture();
+        const stillCurrent = () =>
+          current === generation.current &&
+          walletAuthorization.isCurrent(authorization) &&
+          isSelectedWallet(selected, apiKey);
         const expected = await sessionKeyFor({
           mnemonic: phrase,
           network: selected.network ?? "regtest",
           account: selected.account ?? 0,
         });
+        if (!stillCurrent()) return;
         await ensureLive(phrase, liveOptions(selected, apiKey));
+        if (!stillCurrent()) return;
         if (!isSessionCurrent(expected.key))
           throw new Error("Wallet session changed. Refresh the selected wallet.");
         const info = await liveInfo(true);
+        if (!stillCurrent() || !isSessionCurrent(expected.key)) return;
         const payments = await listLiveHistory();
-        if (current === generation.current && isSessionCurrent(expected.key)) {
+        if (stillCurrent() && isSessionCurrent(expected.key)) {
           setSnapshot({ key, balance: info.balanceSats, payments, updatedAt: Date.now() });
           setError(null);
         }
@@ -142,6 +165,15 @@ export function LiveSendScreen({ member }: { member: Member }) {
   const pending = useRef(false);
   const scan = useRef<HTMLInputElement>(null);
   const epoch = useRef(0);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      epoch.current++;
+    };
+  }, []);
+  const phrase = member.seed.join(" ");
   const [now, setNow] = useState(Date.now());
   const copy = (en: string, bn: string) => liveCopy(lang, en, bn);
   useEffect(() => {
@@ -150,7 +182,21 @@ export function LiveSendScreen({ member }: { member: Member }) {
     setReceipt(null);
     setError(null);
     invalidateLiveQuotes();
-  }, [destination, amount, speed, member.id, member.network, member.account]);
+    return () => {
+      epoch.current++;
+      invalidateLiveQuotes();
+    };
+  }, [
+    destination,
+    amount,
+    speed,
+    member.id,
+    member.mode,
+    member.network,
+    member.account,
+    phrase,
+    apiKey,
+  ]);
   useEffect(() => {
     if (prefill) {
       setDestination(prefill);
@@ -167,6 +213,19 @@ export function LiveSendScreen({ member }: { member: Member }) {
   async function review() {
     if (pending.current) return;
     const requestEpoch = epoch.current;
+    let authorization: number;
+    try {
+      authorization = walletAuthorization.capture();
+    } catch (cause) {
+      setError(explain(cause));
+      return;
+    }
+    const current = () =>
+      mounted.current &&
+      requestEpoch === epoch.current &&
+      walletAuthorization.isCurrent(authorization) &&
+      isSelectedWallet(member, apiKey);
+    if (!current()) return;
     pending.current = true;
     setBusy(true);
     setError(null);
@@ -190,11 +249,14 @@ export function LiveSendScreen({ member }: { member: Member }) {
         network: member.network ?? "regtest",
         account: member.account ?? 0,
       });
+      if (!current()) return;
       await ensureLive(member.seed.join(" "), liveOptions(member, apiKey));
-      if (requestEpoch !== epoch.current || !isSessionCurrent(expected.key))
-        throw new Error("Wallet session changed. Review again.");
+      if (!current()) return;
+      if (!isSessionCurrent(expected.key)) throw new Error("Wallet session changed. Review again.");
       const prepared = await prepareLiveQuote({ destination, amount, speed });
+      if (!current()) return;
       const info = await liveInfo(true);
+      if (!current()) return;
       if (!isSessionCurrent(prepared.sessionKey))
         throw new Error("Wallet session changed. Review again.");
       if (prepared.totalSats > info.balanceSats)
@@ -204,16 +266,29 @@ export function LiveSendScreen({ member }: { member: Member }) {
             "লাইভ balance দিয়ে amount ও fee মেটানো যাচ্ছে না।",
           ),
         );
-      if (requestEpoch === epoch.current) setQuote(prepared);
+      if (current()) setQuote(prepared);
     } catch (cause) {
-      if (requestEpoch === epoch.current) setError(explain(cause));
+      if (current()) setError(explain(cause));
     } finally {
       pending.current = false;
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
   async function confirm() {
-    if (!quote || pending.current) return;
+    if (!quote || pending.current || !mounted.current || !isSelectedWallet(member, apiKey)) return;
+    const requestEpoch = epoch.current;
+    let authorization: number;
+    try {
+      authorization = walletAuthorization.capture();
+    } catch (cause) {
+      setError(explain(cause));
+      return;
+    }
+    const current = () =>
+      mounted.current &&
+      requestEpoch === epoch.current &&
+      walletAuthorization.isCurrent(authorization) &&
+      isSelectedWallet(member, apiKey);
     pending.current = true;
     setBusy(true);
     setError(null);
@@ -226,10 +301,12 @@ export function LiveSendScreen({ member }: { member: Member }) {
           ),
         );
       const payment = await executeLiveQuote(quote.id);
+      if (!current()) return;
       setReceipt(payment);
       setQuote(null);
       window.dispatchEvent(new Event("cpay:wallet-refresh"));
     } catch (cause) {
+      if (!current()) return;
       setQuote(null);
       setError(
         `${explain(cause)} ${copy("If the result is uncertain, check Activity before retrying.", "ফলাফল অনিশ্চিত হলে আবার পাঠানোর আগে Activity দেখুন।")}`,
@@ -237,7 +314,7 @@ export function LiveSendScreen({ member }: { member: Member }) {
       wallet.refresh();
     } finally {
       pending.current = false;
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
   const expired = quote ? now >= quote.expiresAt : false;
@@ -377,6 +454,15 @@ export function LiveReceiveScreen({ member }: { member: Member }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const epoch = useRef(0);
+  const mounted = useRef(false);
+  const phrase = member.seed.join(" ");
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      epoch.current++;
+    };
+  }, []);
   const pending = useRef(false);
   const copy = (en: string, bn: string) => liveCopy(lang, en, bn);
   useEffect(() => {
@@ -386,10 +472,23 @@ export function LiveReceiveScreen({ member }: { member: Member }) {
     return () => {
       epoch.current++;
     };
-  }, [member.id, member.network, member.account, method, amount]);
+  }, [member.id, member.mode, member.network, member.account, phrase, apiKey, method, amount]);
   async function make() {
     if (pending.current) return;
-    const current = epoch.current;
+    const requestEpoch = epoch.current;
+    let authorization: number;
+    try {
+      authorization = walletAuthorization.capture();
+    } catch (cause) {
+      setError(explain(cause));
+      return;
+    }
+    const current = () =>
+      mounted.current &&
+      requestEpoch === epoch.current &&
+      walletAuthorization.isCurrent(authorization) &&
+      isSelectedWallet(member, apiKey);
+    if (!current()) return;
     pending.current = true;
     setBusy(true);
     setError(null);
@@ -399,8 +498,10 @@ export function LiveReceiveScreen({ member }: { member: Member }) {
         network: member.network ?? "regtest",
         account: member.account ?? 0,
       });
+      if (!current()) return;
       await ensureLive(member.seed.join(" "), liveOptions(member, apiKey));
-      if (current !== epoch.current || !isSessionCurrent(expected.key))
+      if (!current()) return;
+      if (!isSessionCurrent(expected.key))
         throw new Error("Wallet session changed. Generate a new request.");
       const response = await receiveLive({
         method,
@@ -408,13 +509,12 @@ export function LiveReceiveScreen({ member }: { member: Member }) {
         description: "CPay",
         tokenIdentifier: "",
       });
-      if (current === epoch.current && isSessionCurrent(expected.key))
-        setRequest(response.paymentRequest);
+      if (current() && isSessionCurrent(expected.key)) setRequest(response.paymentRequest);
     } catch (cause) {
-      if (current === epoch.current) setError(explain(cause));
+      if (current()) setError(explain(cause));
     } finally {
       pending.current = false;
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
   return (

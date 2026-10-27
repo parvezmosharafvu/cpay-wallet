@@ -36,9 +36,8 @@ jobs:
         run: npm run build:web
       - name: Mobile web bundle
         run: npm run build:mobile
-      - name: Install isolated browser
-        if: runner.os == 'Linux'
-        run: node node_modules/playwright/cli.js install --with-deps chromium
       - name: Wallet browser regressions (synthetic wallets, no funds)
         if: runner.os == 'Linux'
+        env:
+          PLAYWRIGHT_CHANNEL: chrome
         run: npm run test:browser

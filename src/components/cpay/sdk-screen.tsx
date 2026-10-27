@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { generateMnemonic, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 import { ArrowLeft } from "lucide-react";
+import { walletAuthorization } from "@/lib/cpay/browser-vault";
 import { appBreezKey } from "@/lib/cpay/app-key";
 import { sdkText, type SdkCopy } from "@/lib/cpay/sdk-copy";
 import {
@@ -122,53 +123,100 @@ export function SdkScreen({ close }: { close: () => void }) {
   const [openUrl, setOpenUrl] = useState("");
   const t = (key: SdkCopy) => sdkText(lang, key);
 
-  async function refresh() {
+  const mounted = useRef(false);
+  const operationEpoch = useRef(0);
+  const running = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      operationEpoch.current++;
+      invalidateLiveQuotes();
+    };
+  }, []);
+  function isCurrent(current: number, authorization?: number) {
+    const selected = useCpay.getState();
+    return (
+      mounted.current &&
+      current === operationEpoch.current &&
+      (authorization === undefined || walletAuthorization.isCurrent(authorization)) &&
+      selected.sdkMnemonic === mnemonic &&
+      selected.sdkNetwork === network &&
+      selected.sdkAccount === account &&
+      (selected.apiKey || appBreezKey()) === apiKey
+    );
+  }
+  async function refresh(current: number, authorization: number) {
+    if (!isCurrent(current, authorization)) return;
     const snap = await walletSnapshot();
+    if (!isCurrent(current, authorization)) return;
     setSats(snap.balanceSats);
     setConnected(true);
     return snap;
   }
 
   useEffect(() => {
+    const current = ++operationEpoch.current;
     invalidateLiveQuotes();
-    setConnected(false); setSats(null); setBolt(""); setOpenUrl("");
+    setConnected(false);
+    setSats(null);
+    setBolt("");
+    setOpenUrl("");
     if (!validateMnemonic(mnemonic, wordlist) || (network === "mainnet" && !apiKey.trim())) {
+      setBusy(false);
       void disconnectLive().catch(() => undefined);
       return;
     }
-    let cancel = false;
+    let authorization: number;
+    try {
+      authorization = walletAuthorization.capture();
+    } catch (cause) {
+      setBusy(false);
+      setOutput(explain(cause));
+      return;
+    }
     setBusy(true);
     void connectLive({ mnemonic, apiKey, network, account })
       .then(async () => {
-        if (cancel) return;
+        if (!isCurrent(current, authorization)) return;
         await watchLive(() => {
-          void refresh().catch(() => undefined);
+          if (isCurrent(current, authorization))
+            void refresh(current, authorization).catch(() => undefined);
         });
-        return refresh();
+        if (!isCurrent(current, authorization)) return;
+        return refresh(current, authorization);
       })
       .then((snap) => {
-        if (!cancel && snap) setOutput(present(snap));
+        if (isCurrent(current, authorization) && snap) setOutput(present(snap));
       })
       .catch((error: unknown) => {
-        if (!cancel) setOutput(explain(error));
+        if (isCurrent(current, authorization)) setOutput(explain(error));
       })
       .finally(() => {
-        if (!cancel) setBusy(false);
+        if (isCurrent(current, authorization)) setBusy(false);
       });
     return () => {
-      cancel = true;
+      operationEpoch.current++;
       invalidateLiveQuotes();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mnemonic, network, account, apiKey]);
 
-  const running = useRef(false);
   async function run(task: () => Promise<unknown>) {
-    if (running.current) return;
+    const current = operationEpoch.current;
+    if (running.current || !isCurrent(current)) return;
+    let authorization: number;
+    try {
+      authorization = walletAuthorization.capture();
+    } catch (cause) {
+      setOutput(explain(cause));
+      return;
+    }
     running.current = true;
     setBusy(true);
     try {
       const value = await task();
+      if (!isCurrent(current, authorization)) return;
       setConnected(isLiveConnected());
       if (value && typeof value === "object") {
         const row = value as { paymentRequest?: unknown; url?: unknown; balanceSats?: unknown };
@@ -178,10 +226,10 @@ export function SdkScreen({ close }: { close: () => void }) {
       }
       setOutput(value === undefined ? "OK" : present(value));
     } catch (error) {
-      setOutput(explain(error));
+      if (isCurrent(current, authorization)) setOutput(explain(error));
     } finally {
       running.current = false;
-      setBusy(false);
+      if (isCurrent(current, authorization)) setBusy(false);
     }
   }
 
@@ -199,7 +247,11 @@ export function SdkScreen({ close }: { close: () => void }) {
           </button>
           <h1 className="text-lg font-semibold">{t("title")}</h1>
         </header>
-        <p className="text-sm font-semibold text-danger">{lang === "bn" ? "Advanced SDK tools · এই কাজগুলো নির্বাচিত SDK wallet-এ সরাসরি প্রভাব ফেলে।" : "Advanced SDK tools · These actions directly affect the connected SDK wallet."}</p>
+        <p className="text-sm font-semibold text-danger">
+          {lang === "bn"
+            ? "Advanced SDK tools · এই কাজগুলো নির্বাচিত SDK wallet-এ সরাসরি প্রভাব ফেলে।"
+            : "Advanced SDK tools · These actions directly affect the connected SDK wallet."}
+        </p>
         <p className="mt-2 text-sm text-muted">{t("warn")}</p>
         <p className={`mt-2 text-sm font-medium ${connected ? "text-primary" : "text-muted"}`}>
           {connected ? t("connected") : t("offline")}
@@ -208,7 +260,12 @@ export function SdkScreen({ close }: { close: () => void }) {
         </p>
         {bolt ? <Qr value={bolt} /> : null}
         {openUrl ? (
-          <a href={openUrl} target="_blank" rel="noreferrer" className="mt-3 block break-all text-sm text-primary">
+          <a
+            href={openUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="mt-3 block break-all text-sm text-primary"
+          >
             {openUrl}
           </a>
         ) : null}
@@ -253,9 +310,13 @@ export function SdkScreen({ close }: { close: () => void }) {
               onRun={run}
             />
           ) : null}
-          {section === "send" ? <SendPane t={t} busy={busy} onRun={run} /> : null}
+          {section === "send" ? (
+            <SendPane key={operationEpoch.current} t={t} busy={busy} onRun={run} />
+          ) : null}
           {section === "receive" ? <ReceivePane t={t} busy={busy} onRun={run} /> : null}
-          {section === "lnurl" ? <LnurlPane t={t} busy={busy} onRun={run} /> : null}
+          {section === "lnurl" ? (
+            <LnurlPane key={operationEpoch.current} t={t} busy={busy} onRun={run} />
+          ) : null}
           {section === "address" ? <AddressPane t={t} busy={busy} onRun={run} /> : null}
           {section === "buy" ? <BuyPane t={t} busy={busy} onRun={run} /> : null}
           {section === "deposits" ? <DepositPane t={t} busy={busy} onRun={run} /> : null}
@@ -343,7 +404,13 @@ function Qr({ value }: { value: string }) {
   useEffect(() => {
     let live = true;
     void import("qrcode")
-      .then((mod) => mod.default.toDataURL(value, { margin: 1, width: 240, color: { dark: "#07110C", light: "#F4F4F5" } }))
+      .then((mod) =>
+        mod.default.toDataURL(value, {
+          margin: 1,
+          width: 240,
+          color: { dark: "#07110C", light: "#F4F4F5" },
+        }),
+      )
       .then((next) => {
         if (live) setUrl(next);
       })
@@ -398,8 +465,22 @@ function WalletPane({
   return (
     <>
       {mnemonic ? <SecretReveal secret={mnemonic} lang={lang} label={t("seed")} /> : null}
-      <Field label={lang === "bn" ? "SDK recovery phrase import" : "Import an SDK recovery phrase"} value={importWords} onChange={setImportWords} mono />
-      <Btn ghost disabled={busy || !validateMnemonic(importWords, wordlist)} onClick={() => { onMnemonic(importWords); setImportWords(""); }}>{lang === "bn" ? "এই phrase ব্যবহার করুন" : "Use this phrase"}</Btn>
+      <Field
+        label={lang === "bn" ? "SDK recovery phrase import" : "Import an SDK recovery phrase"}
+        value={importWords}
+        onChange={setImportWords}
+        mono
+      />
+      <Btn
+        ghost
+        disabled={busy || !validateMnemonic(importWords, wordlist)}
+        onClick={() => {
+          onMnemonic(importWords);
+          setImportWords("");
+        }}
+      >
+        {lang === "bn" ? "এই phrase ব্যবহার করুন" : "Use this phrase"}
+      </Btn>
       <Row>
         <Btn
           ghost
@@ -427,17 +508,34 @@ function WalletPane({
           mainnet
         </button>
       </div>
-      <Field label={t("account")} value={String(account)} onChange={(value) => onAccount(Number(value) || 0)} mono />
-      <Btn disabled={busy} onClick={onConnect}>{t("connect")}</Btn>
+      <Field
+        label={t("account")}
+        value={String(account)}
+        onChange={(value) => onAccount(Number(value) || 0)}
+        mono
+      />
+      <Btn disabled={busy} onClick={onConnect}>
+        {t("connect")}
+      </Btn>
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(syncLive)}>{t("sync")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => liveInfo(true))}>{t("info")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(syncLive)}>
+          {t("sync")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => liveInfo(true))}>
+          {t("info")}
+        </Btn>
       </Row>
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(listLivePayments)}>{t("history")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(sparkStatus)}>{t("status")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(listLivePayments)}>
+          {t("history")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(sparkStatus)}>
+          {t("status")}
+        </Btn>
       </Row>
-      <Btn ghost disabled={busy} onClick={() => void onRun(disconnectLive)}>{t("disconnect")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(disconnectLive)}>
+        {t("disconnect")}
+      </Btn>
       <details className="rounded-2xl border border-line p-3">
         <summary className="cursor-pointer text-sm font-medium">{t("turnkey")}</summary>
         <div className="mt-3 flex flex-col gap-3">
@@ -479,7 +577,12 @@ function SendPane({ t, busy, onRun }: Pane) {
   const [singleReady, setSingleReady] = useState(false);
   const [batchReady, setBatchReady] = useState(false);
   const epoch = useRef(0);
-  useEffect(() => { epoch.current++; setSingleReady(false); setBatchReady(false); invalidateLiveQuotes(); }, [destination, amount, tokenIdentifier, speed, second, secondAmount]);
+  useEffect(() => {
+    epoch.current++;
+    setSingleReady(false);
+    setBatchReady(false);
+    invalidateLiveQuotes();
+  }, [destination, amount, tokenIdentifier, speed, second, secondAmount]);
   return (
     <>
       <Field label={t("destination")} value={destination} onChange={setDestination} mono />
@@ -497,11 +600,35 @@ function SendPane({ t, busy, onRun }: Pane) {
           </button>
         ))}
       </div>
-      <Btn disabled={busy} onClick={() => void onRun(() => parseLive(destination))}>{t("parse")}</Btn>
-      <Btn disabled={busy} onClick={() => { const current = epoch.current; void onRun(async () => { const value = await prepareLiveSend({ destination, amount, tokenIdentifier }); if (current === epoch.current) setSingleReady(true); return value; }); }}>{t("prepare")}</Btn>
+      <Btn disabled={busy} onClick={() => void onRun(() => parseLive(destination))}>
+        {t("parse")}
+      </Btn>
+      <Btn
+        disabled={busy}
+        onClick={() => {
+          const current = epoch.current;
+          void onRun(async () => {
+            const value = await prepareLiveSend({ destination, amount, tokenIdentifier });
+            if (current === epoch.current) setSingleReady(true);
+            return value;
+          });
+        }}
+      >
+        {t("prepare")}
+      </Btn>
       <Row>
-        <Btn disabled={busy || !singleReady} onClick={() => {setSingleReady(false); void onRun(() => sendLive(speed));}}>{t("pay")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(buildUnsignedLive)}>{t("unsigned")}</Btn>
+        <Btn
+          disabled={busy || !singleReady}
+          onClick={() => {
+            setSingleReady(false);
+            void onRun(() => sendLive(speed));
+          }}
+        >
+          {t("pay")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(buildUnsignedLive)}>
+          {t("unsigned")}
+        </Btn>
       </Row>
       <Field label={t("destination")} value={second} onChange={setSecond} mono />
       <Field label={t("amount")} value={secondAmount} onChange={setSecondAmount} mono />
@@ -522,7 +649,15 @@ function SendPane({ t, busy, onRun }: Pane) {
       >
         {t("prepare")}
       </Btn>
-      <Btn disabled={busy || !batchReady} onClick={() => {setBatchReady(false); void onRun(sendBatchLive);}}>{t("batch")}</Btn>
+      <Btn
+        disabled={busy || !batchReady}
+        onClick={() => {
+          setBatchReady(false);
+          void onRun(sendBatchLive);
+        }}
+      >
+        {t("batch")}
+      </Btn>
     </>
   );
 }
@@ -550,10 +685,24 @@ function ReceivePane({ t, busy, onRun }: Pane) {
       <Field label={t("amount")} value={amount} onChange={setAmount} mono />
       <Field label={t("description")} value={description} onChange={setDescription} />
       <Field label={t("tokenId")} value={tokenIdentifier} onChange={setToken} mono />
-      <Btn disabled={busy} onClick={() => void onRun(() => receiveLive({ method, amount, description, tokenIdentifier }))}>{t("receive")}</Btn>
-      <Btn ghost disabled={busy} onClick={() => void onRun(loadReceiveRoutes)}>{t("routes")}</Btn>
+      <Btn
+        disabled={busy}
+        onClick={() =>
+          void onRun(() => receiveLive({ method, amount, description, tokenIdentifier }))
+        }
+      >
+        {t("receive")}
+      </Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(loadReceiveRoutes)}>
+        {t("routes")}
+      </Btn>
       <Field label={t("pick")} value={route} onChange={setRoute} mono />
-      <Btn disabled={busy} onClick={() => void onRun(() => receiveOnRoute(Number(route) || 0, amount))}>USDC / USDT</Btn>
+      <Btn
+        disabled={busy}
+        onClick={() => void onRun(() => receiveOnRoute(Number(route) || 0, amount))}
+      >
+        USDC / USDT
+      </Btn>
     </>
   );
 }
@@ -563,20 +712,71 @@ function LnurlPane({ t, busy, onRun }: Pane) {
   const [amount, setAmount] = useState("");
   const [comment, setComment] = useState("");
   const [ready, setReady] = useState(false);
+  const [parsedInput, setParsedInput] = useState<string | null>(null);
   const epoch = useRef(0);
-  useEffect(() => {epoch.current++;setReady(false);invalidateLiveQuotes();}, [input, amount, comment]);
+  useEffect(() => {
+    epoch.current++;
+    setReady(false);
+    setParsedInput(null);
+    invalidateLiveQuotes();
+    return () => {
+      epoch.current++;
+      invalidateLiveQuotes();
+    };
+  }, [input]);
+  useEffect(() => {
+    epoch.current++;
+    setReady(false);
+    invalidateLiveQuotes({ preserveParsed: true });
+  }, [amount, comment]);
   return (
     <>
       <Field label="LNURL" value={input} onChange={setInput} mono />
       <Field label={t("amount")} value={amount} onChange={setAmount} mono />
       <Field label={t("comment")} value={comment} onChange={setComment} />
-      <Btn disabled={busy} onClick={() => void onRun(() => parseLive(input))}>{t("parse")}</Btn>
-      <Btn disabled={busy} onClick={() => {const current=epoch.current;void onRun(async()=>{const value=await prepareLnurlLive(amount, comment);if(current===epoch.current)setReady(true);return value;});}}>{t("prepare")}</Btn>
+      <Btn
+        disabled={busy}
+        onClick={() => {
+          const current = epoch.current;
+          void onRun(async () => {
+            const result = await parseLive(input);
+            if (current === epoch.current) setParsedInput(input);
+            return result;
+          });
+        }}
+      >
+        {t("parse")}
+      </Btn>
+      <Btn
+        disabled={busy || parsedInput !== input}
+        onClick={() => {
+          const current = epoch.current;
+          void onRun(async () => {
+            const value = await prepareLnurlLive(amount, comment);
+            if (current === epoch.current) setReady(true);
+            return value;
+          });
+        }}
+      >
+        {t("prepare")}
+      </Btn>
       <Row>
-        <Btn disabled={busy || !ready} onClick={() => {setReady(false);void onRun(payLnurlLive);}}>{t("pay")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => withdrawLnurlLive(amount))}>{t("withdraw")}</Btn>
+        <Btn
+          disabled={busy || !ready}
+          onClick={() => {
+            setReady(false);
+            void onRun(payLnurlLive);
+          }}
+        >
+          {t("pay")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => withdrawLnurlLive(amount))}>
+          {t("withdraw")}
+        </Btn>
       </Row>
-      <Btn ghost disabled={busy} onClick={() => void onRun(authLnurlLive)}>{t("auth")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(authLnurlLive)}>
+        {t("auth")}
+      </Btn>
     </>
   );
 }
@@ -590,16 +790,35 @@ function AddressPane({ t, busy, onRun }: Pane) {
       <Field label={t("username")} value={username} onChange={setUsername} />
       <Field label={t("description")} value={description} onChange={setDescription} />
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => checkAddress(username))}>{t("check")}</Btn>
-        <Btn disabled={busy} onClick={() => void onRun(() => registerAddress(username, description))}>{t("register")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => checkAddress(username))}>
+          {t("check")}
+        </Btn>
+        <Btn
+          disabled={busy}
+          onClick={() => void onRun(() => registerAddress(username, description))}
+        >
+          {t("register")}
+        </Btn>
       </Row>
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(currentAddress)}>{t("current")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(removeAddress)}>{t("remove")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(currentAddress)}>
+          {t("current")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(removeAddress)}>
+          {t("remove")}
+        </Btn>
       </Row>
       <Field label={t("pubkey")} value={pubkey} onChange={setPubkey} mono />
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => authorizeAddress(pubkey))}>{t("authorize")}</Btn>
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => claimAddressTransfer(description))}>{t("claimAddr")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(() => authorizeAddress(pubkey))}>
+        {t("authorize")}
+      </Btn>
+      <Btn
+        ghost
+        disabled={busy}
+        onClick={() => void onRun(() => claimAddressTransfer(description))}
+      >
+        {t("claimAddr")}
+      </Btn>
     </>
   );
 }
@@ -611,8 +830,12 @@ function BuyPane({ t, busy, onRun }: Pane) {
   return (
     <>
       <Field label={t("amount")} value={amount} onChange={setAmount} mono />
-      <Btn disabled={busy} onClick={() => void onRun(() => buyLive("cashApp", amount))}>{t("cash")}</Btn>
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => buyLive("moonpay", amount))}>{t("moon")}</Btn>
+      <Btn disabled={busy} onClick={() => void onRun(() => buyLive("cashApp", amount))}>
+        {t("cash")}
+      </Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(() => buyLive("moonpay", amount))}>
+        {t("moon")}
+      </Btn>
       <Field label={t("destination")} value={address} onChange={setAddress} mono />
       <Field label={t("pick")} value={route} onChange={setRoute} mono />
       <Btn
@@ -645,16 +868,28 @@ function DepositPane({ t, busy, onRun }: Pane) {
   const [fee, setFee] = useState("2");
   return (
     <>
-      <Btn ghost disabled={busy} onClick={() => void onRun(listDeposits)}>{t("deposits")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(listDeposits)}>
+        {t("deposits")}
+      </Btn>
       <Field label={t("txid")} value={txid} onChange={setTxid} mono />
       <Field label={t("vout")} value={vout} onChange={setVout} mono />
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => quoteDeposit(txid, vout))}>{t("quote")}</Btn>
-        <Btn disabled={busy} onClick={() => void onRun(() => claimDepositLive(txid, vout))}>{t("claim")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => quoteDeposit(txid, vout))}>
+          {t("quote")}
+        </Btn>
+        <Btn disabled={busy} onClick={() => void onRun(() => claimDepositLive(txid, vout))}>
+          {t("claim")}
+        </Btn>
       </Row>
       <Field label={t("dest")} value={destination} onChange={setDestination} mono />
       <Field label={t("fee")} value={fee} onChange={setFee} mono />
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => refundDepositLive(txid, vout, destination, fee))}>{t("refund")}</Btn>
+      <Btn
+        ghost
+        disabled={busy}
+        onClick={() => void onRun(() => refundDepositLive(txid, vout, destination, fee))}
+      >
+        {t("refund")}
+      </Btn>
     </>
   );
 }
@@ -676,23 +911,50 @@ function TokenPane({ t, busy, onRun }: Pane) {
         <Field label={t("decimals")} value={decimals} onChange={setDecimals} mono />
         <Field label={t("supply")} value={maxSupply} onChange={setSupply} mono />
       </Row>
-      <button type="button" onClick={() => setFreezable((v) => !v)} className={`h-12 rounded-2xl border text-sm ${freezable ? "border-primary text-primary" : "border-line"}`}>
+      <button
+        type="button"
+        onClick={() => setFreezable((v) => !v)}
+        className={`h-12 rounded-2xl border text-sm ${freezable ? "border-primary text-primary" : "border-line"}`}
+      >
         {t("freeze")}
       </button>
-      <Btn disabled={busy} onClick={() => void onRun(() => createTokenLive({ name, ticker, decimals, maxSupply, freezable }))}>{t("create")}</Btn>
+      <Btn
+        disabled={busy}
+        onClick={() =>
+          void onRun(() => createTokenLive({ name, ticker, decimals, maxSupply, freezable }))
+        }
+      >
+        {t("create")}
+      </Btn>
       <Field label={t("amount")} value={amount} onChange={setAmount} mono />
       <Row>
-        <Btn disabled={busy} onClick={() => void onRun(() => mintTokenLive(amount))}>{t("mint")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => burnTokenLive(amount))}>{t("burn")}</Btn>
+        <Btn disabled={busy} onClick={() => void onRun(() => mintTokenLive(amount))}>
+          {t("mint")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => burnTokenLive(amount))}>
+          {t("burn")}
+        </Btn>
       </Row>
       <Field label={t("destination")} value={address} onChange={setAddress} mono />
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => freezeTokenLive(address, true))}>{t("lock")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => freezeTokenLive(address, false))}>{t("unlock")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => freezeTokenLive(address, true))}>
+          {t("lock")}
+        </Btn>
+        <Btn
+          ghost
+          disabled={busy}
+          onClick={() => void onRun(() => freezeTokenLive(address, false))}
+        >
+          {t("unlock")}
+        </Btn>
       </Row>
-      <Btn ghost disabled={busy} onClick={() => void onRun(issuerState)}>{t("issuer")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(issuerState)}>
+        {t("issuer")}
+      </Btn>
       <Field label={t("tokenId")} value={ids} onChange={setIds} mono />
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => tokenMetadata(ids))}>{t("lookup")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(() => tokenMetadata(ids))}>
+        {t("lookup")}
+      </Btn>
     </>
   );
 }
@@ -703,14 +965,26 @@ function ContactPane({ t, busy, onRun }: Pane) {
   const [contactId, setContactId] = useState("");
   return (
     <>
-      <Btn ghost disabled={busy} onClick={() => void onRun(listSdkContacts)}>{t("contacts")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(listSdkContacts)}>
+        {t("contacts")}
+      </Btn>
       <Field label={t("name")} value={name} onChange={setName} />
       <Field label={t("destination")} value={paymentIdentifier} onChange={setId} mono />
       <Field label={t("id")} value={contactId} onChange={setContactId} mono />
-      <Btn disabled={busy} onClick={() => void onRun(() => addSdkContact(name, paymentIdentifier))}>{t("add")}</Btn>
+      <Btn disabled={busy} onClick={() => void onRun(() => addSdkContact(name, paymentIdentifier))}>
+        {t("add")}
+      </Btn>
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => updateSdkContact(contactId, name, paymentIdentifier))}>{t("update")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => deleteSdkContact(contactId))}>{t("remove")}</Btn>
+        <Btn
+          ghost
+          disabled={busy}
+          onClick={() => void onRun(() => updateSdkContact(contactId, name, paymentIdentifier))}
+        >
+          {t("update")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => deleteSdkContact(contactId))}>
+          {t("remove")}
+        </Btn>
       </Row>
     </>
   );
@@ -719,8 +993,12 @@ function ContactPane({ t, busy, onRun }: Pane) {
 function FiatPane({ t, busy, onRun }: Pane) {
   return (
     <>
-      <Btn disabled={busy} onClick={() => void onRun(fiatCurrencies)}>{t("currencies")}</Btn>
-      <Btn ghost disabled={busy} onClick={() => void onRun(fiatRates)}>{t("rates")}</Btn>
+      <Btn disabled={busy} onClick={() => void onRun(fiatCurrencies)}>
+        {t("currencies")}
+      </Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(fiatRates)}>
+        {t("rates")}
+      </Btn>
     </>
   );
 }
@@ -733,28 +1011,63 @@ function SettingsPane({ t, busy, onRun }: Pane) {
   const [hookId, setHookId] = useState("");
   return (
     <>
-      <Btn ghost disabled={busy} onClick={() => void onRun(readSettings)}>{t("read")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(readSettings)}>
+        {t("read")}
+      </Btn>
       <Row>
-        <Btn disabled={busy} onClick={() => void onRun(() => writeSettings({ privateMode: true }))}>{t("privateOn")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => writeSettings({ privateMode: false }))}>{t("privateOff")}</Btn>
+        <Btn disabled={busy} onClick={() => void onRun(() => writeSettings({ privateMode: true }))}>
+          {t("privateOn")}
+        </Btn>
+        <Btn
+          ghost
+          disabled={busy}
+          onClick={() => void onRun(() => writeSettings({ privateMode: false }))}
+        >
+          {t("privateOff")}
+        </Btn>
       </Row>
       <Field label={t("stable")} value={label} onChange={setLabel} />
       <Row>
-        <Btn disabled={busy} onClick={() => void onRun(() => writeSettings({ stableLabel: label }))}>{t("stable")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => writeSettings({ clearStable: true }))}>{t("clearStable")}</Btn>
+        <Btn
+          disabled={busy}
+          onClick={() => void onRun(() => writeSettings({ stableLabel: label }))}
+        >
+          {t("stable")}
+        </Btn>
+        <Btn
+          ghost
+          disabled={busy}
+          onClick={() => void onRun(() => writeSettings({ clearStable: true }))}
+        >
+          {t("clearStable")}
+        </Btn>
       </Row>
       <Field label={t("master")} value={master} onChange={setMaster} mono />
       <Row>
-        <Btn disabled={busy} onClick={() => void onRun(() => writeSettings({ masterKey: master }))}>{t("master")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => writeSettings({ clearMaster: true }))}>{t("clearMaster")}</Btn>
+        <Btn disabled={busy} onClick={() => void onRun(() => writeSettings({ masterKey: master }))}>
+          {t("master")}
+        </Btn>
+        <Btn
+          ghost
+          disabled={busy}
+          onClick={() => void onRun(() => writeSettings({ clearMaster: true }))}
+        >
+          {t("clearMaster")}
+        </Btn>
       </Row>
       <Field label={t("hookUrl")} value={url} onChange={setUrl} mono />
       <Field label={t("secret")} value={secret} onChange={setSecret} mono />
-      <Btn disabled={busy} onClick={() => void onRun(() => registerHook(url, secret))}>{t("hook")}</Btn>
+      <Btn disabled={busy} onClick={() => void onRun(() => registerHook(url, secret))}>
+        {t("hook")}
+      </Btn>
       <Field label={t("id")} value={hookId} onChange={setHookId} mono />
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(listHooks)}>{t("hooks")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => removeHook(hookId))}>{t("unhook")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(listHooks)}>
+          {t("hooks")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => removeHook(hookId))}>
+          {t("unhook")}
+        </Btn>
       </Row>
     </>
   );
@@ -779,20 +1092,38 @@ function AdvancedPane({ t, busy, onRun }: Pane) {
   return (
     <>
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(optimizeLive)}>{t("leaves")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(feeRates)}>{t("fees")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(optimizeLive)}>
+          {t("leaves")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(feeRates)}>
+          {t("fees")}
+        </Btn>
       </Row>
       <Field label={t("message")} value={message} onChange={setMessage} />
-      <Btn disabled={busy} onClick={() => void onRun(() => signLive(message))}>{t("sign")}</Btn>
+      <Btn disabled={busy} onClick={() => void onRun(() => signLive(message))}>
+        {t("sign")}
+      </Btn>
       <Field label={t("pubkey")} value={pubkey} onChange={setPubkey} mono />
       <Field label={t("signature")} value={signature} onChange={setSignature} mono />
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => checkLive(message, pubkey, signature))}>{t("verify")}</Btn>
-      <Btn ghost disabled={busy} onClick={() => void onRun(refundConversions)}>{t("conversions")}</Btn>
+      <Btn
+        ghost
+        disabled={busy}
+        onClick={() => void onRun(() => checkLive(message, pubkey, signature))}
+      >
+        {t("verify")}
+      </Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(refundConversions)}>
+        {t("conversions")}
+      </Btn>
       <Field label={t("dest")} value={destination} onChange={setDestination} mono />
       <Field label={t("fee")} value={fee} onChange={setFee} mono />
       <Row>
-        <Btn disabled={busy} onClick={() => void onRun(() => prepareExit(fee, destination))}>{t("exit")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(exportExit)}>{t("exportExit")}</Btn>
+        <Btn disabled={busy} onClick={() => void onRun(() => prepareExit(fee, destination))}>
+          {t("exit")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(exportExit)}>
+          {t("exportExit")}
+        </Btn>
       </Row>
       <Field label={t("txid")} value={txid} onChange={setTxid} mono />
       <Field label={t("vout")} value={vout} onChange={setVout} mono />
@@ -801,28 +1132,48 @@ function AdvancedPane({ t, busy, onRun }: Pane) {
       <Field label={t("secret")} value={secret} onChange={setSecret} mono />
       <Btn
         disabled={busy}
-        onClick={() => void onRun(() => broadcastExit({ txid, vout, value, pubkey: fundKey, secretHex: secret }))}
+        onClick={() =>
+          void onRun(() => broadcastExit({ txid, vout, value, pubkey: fundKey, secretHex: secret }))
+        }
       >
         {t("broadcast")}
       </Btn>
-      <Btn ghost disabled={busy} onClick={() => void onRun(checkExit)}>{t("checkExit")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(checkExit)}>
+        {t("checkExit")}
+      </Btn>
       <Field label={t("paymentLookup")} value={paymentId} onChange={setPaymentId} mono />
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => getLivePayment(paymentId))}>{t("paymentLookup")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(() => getLivePayment(paymentId))}>
+        {t("paymentLookup")}
+      </Btn>
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(buildUnsignedBatchLive)}>{t("unsignedBatch")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(buildUnsignedLnurlLive)}>{t("unsignedLnurl")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(buildUnsignedBatchLive)}>
+          {t("unsignedBatch")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(buildUnsignedLnurlLive)}>
+          {t("unsignedLnurl")}
+        </Btn>
       </Row>
       <Field label={t("publish")} value={signed} onChange={setSigned} mono />
       <Row>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => publishTransferLive(signed))}>{t("publish")}</Btn>
-        <Btn ghost disabled={busy} onClick={() => void onRun(() => publishLnurlLive(signed))}>{t("publishLnurl")}</Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => publishTransferLive(signed))}>
+          {t("publish")}
+        </Btn>
+        <Btn ghost disabled={busy} onClick={() => void onRun(() => publishLnurlLive(signed))}>
+          {t("publishLnurl")}
+        </Btn>
       </Row>
       <Field label={t("importExit")} value={blob} onChange={setBlob} mono />
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => importExit(blob))}>{t("importExit")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(() => importExit(blob))}>
+        {t("importExit")}
+      </Btn>
       <Field label={t("htlc")} value={preimage} onChange={setPreimage} mono />
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => claimHtlc(preimage))}>{t("htlc")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(() => claimHtlc(preimage))}>
+        {t("htlc")}
+      </Btn>
       <Field label={t("tokenId")} value={tokenId} onChange={setTokenId} mono />
-      <Btn ghost disabled={busy} onClick={() => void onRun(() => conversionLimits(tokenId))}>{t("limits")}</Btn>
+      <Btn ghost disabled={busy} onClick={() => void onRun(() => conversionLimits(tokenId))}>
+        {t("limits")}
+      </Btn>
     </>
   );
 }

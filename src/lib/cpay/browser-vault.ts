@@ -1,4 +1,6 @@
 import { WalletVault } from "./vault.ts";
+import { WalletAuthorization } from "./wallet-authorization.ts";
+export const walletAuthorization = new WalletAuthorization();
 let vault: WalletVault | null = null;
 let state: "loading" | "new" | "locked" | "unlocked" = "loading";
 let error = "";
@@ -13,10 +15,16 @@ export function browserVault() {
 }
 export function refreshVaultState() {
   const v = browserVault();
-  state = v.isUnlocked() ? "unlocked" : v.exists() ? "locked" : "new";
+  const next = v.isUnlocked() ? "unlocked" : v.exists() ? "locked" : "new";
+  if (next !== state) {
+    if (next === "unlocked") walletAuthorization.unlock();
+    else walletAuthorization.lock();
+  }
+  state = next;
   emit();
 }
 export function beginVaultLock() {
+  walletAuthorization.lock();
   state = "locked";
   emit();
 }
