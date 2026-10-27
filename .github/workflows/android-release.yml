@@ -14,10 +14,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: android-apk-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -39,46 +35,6 @@ jobs:
           cache-dependency-path: |
             android/**/*.gradle
             android/gradle/wrapper/gradle-wrapper.properties
-      - name: Prepare original release signing key when configured
-        id: signing
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          PUBLISH: ${{ inputs.publish || false }}
-        run: |
-          python3 - <<'PY'
-          import base64, os, pathlib
-          fields = [os.environ.get(k, '') for k in ['KEYSTORE_B64','STORE_PASSWORD','KEY_ALIAS','KEY_PASSWORD']]
-          present = [bool(value) for value in fields]
-          if any(present) and not all(present):
-              raise SystemExit('Signing configuration is incomplete; all four Android signing secrets are required.')
-          signed = all(present)
-          if os.environ['PUBLISH'] == 'true' and not signed:
-              raise SystemExit('Cannot publish: original Android release signing secrets are missing.')
-          if signed:
-              keyfile = pathlib.Path(os.environ['RUNNER_TEMP']) / 'cpay-release.jks'
-              keyfile.write_bytes(base64.b64decode(fields[0], validate=True))
-              keyfile.chmod(0o600)
-              def prop(value):
-                  out = ''
-                  for char in value:
-                      if char == '\\': out += '\\\\'
-                      elif char == '\n': out += '\\n'
-                      elif char == '\r': out += '\\r'
-                      elif char == '\t': out += '\\t'
-                      elif char == ' ': out += '\\ '
-                      elif ord(char) > 127:
-                          out += ''.join('\\u%04x' % int.from_bytes(value,'big') for value in [char.encode('utf-16-be')[i:i+2] for i in range(0,len(char.encode('utf-16-be')),2)])
-                      else: out += char
-                  return out
-              values = {'storeFile':str(keyfile),'storePassword':fields[1],'keyAlias':fields[2],'keyPassword':fields[3]}
-              pathlib.Path('android/keystore.properties').write_text(''.join(k+'='+prop(v)+'\n' for k,v in values.items()), encoding='ascii')
-          with open(os.environ['GITHUB_OUTPUT'],'a') as output:
-              output.write('signed='+str(signed).lower()+'\n')
-          print('Using original release signing configuration.' if signed else 'No signing key configured: producing an UNSIGNED, non-installable build artifact only.')
-          PY
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - run: npm test
@@ -93,8 +49,17 @@ jobs:
       - name: Install Android SDK 36 tools
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
           log-accepted-android-sdk-licenses: false
+      - name: Prepare original release signing key when configured
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PUBLISH: ${{ inputs.publish || false }}
+        run: node scripts/prepare-android-signing.mjs
       - name: Build native release APK
         working-directory: android
         run: ./gradlew --no-daemon assembleRelease
@@ -150,6 +115,11 @@ jobs:
           PY
           (cd apk-output && sha256sum --check SHA256SUMS.txt)
           tag=v1.5.0-android
+          existing_tag=$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}")
+          if [ -n "$existing_tag" ]; then
+            echo 'Release tag already exists; inspect its target instead of reusing it.' >&2
+            exit 1
+          fi
           if gh release view "$tag" >/dev/null 2>&1; then
             echo 'Release already exists; inspect it instead of overwriting APK assets.' >&2
             exit 1
