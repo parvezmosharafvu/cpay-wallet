@@ -26,11 +26,21 @@ export function parseApkMetadata(badging, policy = ORIGINAL_RELEASE) {
     throw new Error("APK package/version does not match the selected CPay release policy.");
   if (policy.label && !badging.split(/\r?\n/).includes(`application-label:'${policy.label}'`))
     throw new Error("Fresh APK launcher label is missing or incorrect.");
-  if (
-    policy.label &&
-    !/launchable-activity: name='technology\.cpay\.wallet\.MainActivity'/.test(badging)
-  )
-    throw new Error("Fresh APK launcher activity is missing or incorrect.");
+  if (policy.label) {
+    const launchers = badging
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("launchable-activity:"));
+    const activity =
+      launchers.length === 1
+        ? /^launchable-activity:\s+name='([^']+)'\s+label='([^']*)'(?:\s|$)/.exec(launchers[0])
+        : null;
+    if (
+      !activity ||
+      activity[1] !== "technology.cpay.wallet.MainActivity" ||
+      activity[2] !== policy.label
+    )
+      throw new Error("Fresh APK launcher activity or label is missing or incorrect.");
+  }
   return metadata;
 }
 export function verifiedSigner(output, expectedSigner = EXPECTED_SIGNER) {

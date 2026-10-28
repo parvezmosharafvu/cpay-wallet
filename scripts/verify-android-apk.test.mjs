@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import {
   EXPECTED_SIGNER,
@@ -29,8 +30,50 @@ launchable-activity: name='technology.cpay.wallet.MainActivity' label='CPay 1.5'
     fresh.replace("'6'", "'5'"),
     fresh.replace("application-label:'CPay 1.5'", "application-label:'CPay'"),
     fresh.replace("wallet.MainActivity", "wallet.fresh.MainActivity"),
+    fresh.replace("label='CPay 1.5'", "label='CPay'"),
+    fresh.replace(" label='CPay 1.5'", ""),
+    fresh.replace("label='CPay 1.5'", "label=''"),
+    fresh.replace(/\nlaunchable-activity:.*$/, ""),
   ])
     assert.throws(() => parseApkMetadata(bad, FRESH_RELEASE));
+  // Real aapt output separates the launcher fields with two spaces and includes an icon.
+  assert.equal(
+    parseApkMetadata(
+      fresh.replace(" label='", "  label='") + " icon='res/mipmap/icon.png'",
+      FRESH_RELEASE,
+    ).package,
+    FRESH_RELEASE.package,
+  );
+});
+
+test("Capacitor installation mode defaults to original and validates the shared environment flag", () => {
+  const moduleUrl = new URL("../capacitor.config.ts", import.meta.url).href;
+  const code = `import config from ${JSON.stringify(moduleUrl)}; console.log(JSON.stringify(config));`;
+  const run = (value) => {
+    const env = { ...process.env };
+    delete env.CPAY_FRESH_INSTALL;
+    if (value !== undefined) env.CPAY_FRESH_INSTALL = value;
+    return spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", "--input-type=module", "-e", code],
+      { env, encoding: "utf8" },
+    );
+  };
+  for (const value of [undefined, "false", "true"]) {
+    const result = run(value);
+    assert.equal(result.status, 0, result.stderr);
+    const config = JSON.parse(result.stdout);
+    assert.equal(
+      config.appId,
+      value === "true" ? "technology.cpay.wallet.fresh" : "technology.cpay.wallet",
+    );
+    assert.equal(config.appName, value === "true" ? "CPay 1.5" : "CPay");
+  }
+  for (const value of ["", "TRUE", "1", " false"]) {
+    const result = run(value);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /CPAY_FRESH_INSTALL must be explicitly true or false/);
+  }
 });
 test("original and fresh signing policies cannot be substituted for each other", () => {
   const oldSignature = `Signer #1 certificate SHA-256 digest: ${EXPECTED_SIGNER}`;

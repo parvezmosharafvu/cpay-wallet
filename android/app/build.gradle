@@ -1,10 +1,20 @@
 apply plugin: 'com.android.application'
 
 // A new signing identity must be a separate install, never an update to an existing wallet.
-def cpayFreshInstallValue = providers.gradleProperty('cpayFreshInstall').orElse('false').get()
-if (!(cpayFreshInstallValue in ['true', 'false'])) {
+def cpayFreshInstallProperty = providers.gradleProperty('cpayFreshInstall').getOrNull()
+def cpayFreshInstallEnvironment = providers.environmentVariable('CPAY_FRESH_INSTALL').orElse('false').get()
+if (cpayFreshInstallProperty != null && !(cpayFreshInstallProperty in ['true', 'false'])) {
     throw new GradleException('cpayFreshInstall must be explicitly true or false.')
 }
+if (!(cpayFreshInstallEnvironment in ['true', 'false'])) {
+    throw new GradleException('CPAY_FRESH_INSTALL must be explicitly true or false.')
+}
+if (cpayFreshInstallProperty != null &&
+        cpayFreshInstallProperty != cpayFreshInstallEnvironment) {
+    throw new GradleException('cpayFreshInstall conflicts with CPAY_FRESH_INSTALL; use the same installation mode for Capacitor and Gradle.')
+}
+// The environment is shared with Capacitor; an optional -P can only confirm it, not override it.
+def cpayFreshInstallValue = cpayFreshInstallEnvironment
 def cpayFreshInstall = cpayFreshInstallValue == 'true'
 
 def keystorePropertiesFile = rootProject.file("keystore.properties")

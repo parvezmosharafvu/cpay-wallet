@@ -93,6 +93,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main' && needs.build.outputs.signed == 'true'
     needs: build
     runs-on: ubuntu-24.04
+    concurrency:
+      group: cpay-android-release-publication
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -126,4 +129,4 @@ jobs:
           fi
           gh release create "$tag" --draft --target "$GITHUB_SHA" --title 'CPay 1.5 — encrypted wallet vault' --notes-file docs/android-release-notes.md
           gh release upload "$tag" apk-output/CPay.apk apk-output/SHA256SUMS.txt apk-output/apk-metadata.json
-          gh release edit "$tag" --draft=false --latest
+          gh release edit "$tag" --draft=false --latest=false
