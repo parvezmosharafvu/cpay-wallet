@@ -30,7 +30,7 @@ if (present.some(Boolean) && !present.every(Boolean))
   );
 const signed = present.every(Boolean);
 if (process.env.PUBLISH === "true" && !signed)
-  throw new Error("Cannot publish: original Android release signing secrets are missing.");
+  throw new Error("Cannot publish: Android release signing secrets are missing.");
 if (signed) {
   // Standard base64 tools may wrap output. Ignore only ASCII whitespace, then validate.
   const encoded = fields[0].replace(/[ \t\r\n]/g, "");
@@ -55,6 +55,6 @@ if (signed) {
 writeFileSync(process.env.GITHUB_OUTPUT, `signed=${signed}\n`, { flag: "a" });
 console.log(
   signed
-    ? "Using original release signing configuration."
+    ? "Using configured Android release signing key."
     : "No signing key configured: producing an UNSIGNED, non-installable build artifact only.",
 );

@@ -1,5 +1,15 @@
 # Android APK build and publication
 
+## Separate fresh installation
+
+The **Android fresh install** workflow builds `technology.cpay.wallet.fresh`, labeled **CPay 1.5**, using the persistent new signer pinned in `android/fresh-release.json`. It installs beside CPay 1.4 and cannot access the old app's private data automatically. Do not uninstall the old app as part of this installation.
+
+This workflow uses separate `FRESH_ANDROID_KEYSTORE_BASE64`, `FRESH_ANDROID_STORE_PASSWORD`, `FRESH_ANDROID_KEY_ALIAS` and `FRESH_ANDROID_KEY_PASSWORD` Actions secrets. The fresh keystore is PKCS12. Keep its encrypted keystore and credentials backed up privately; never regenerate or replace this key for future updates to the fresh package.
+
+Fresh builds use `CPAY_FRESH_INSTALL=true` for Capacitor sync and `-PcpayFreshInstall=true` for Gradle. The verifier checks both identities, launcher activity/label, current vault bundle and fresh pinned certificate. Emulator checks install both old and new APKs without removing either and verify the new app renders. Main-only manual publication with `publish=true` waits for build and emulator success, then publishes `v1.5.0-android-fresh` as latest. Release assets include the signed APK, checksum and provenance; private signing files are never uploaded as artifacts.
+
+## Original compatible updates
+
 Merging source does not rebuild existing GitHub release assets. Run the **Android APK** workflow to produce an actual native APK from the selected commit. The workflow builds mobile assets, syncs Capacitor, compiles with JDK 21 / SDK 36, checks package/version, inspects bundled vault code and uploads the APK plus checksum/provenance metadata.
 
 Without signing secrets the result is **CPay-1.5-unsigned.apk**: a build artifact only, not installable and never published as a stable release. Do not rename an unsigned file to CPay.apk or ask users to uninstall their existing wallet.

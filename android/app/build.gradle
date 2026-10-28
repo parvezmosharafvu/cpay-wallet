@@ -1,5 +1,12 @@
 apply plugin: 'com.android.application'
 
+// A new signing identity must be a separate install, never an update to an existing wallet.
+def cpayFreshInstallValue = providers.gradleProperty('cpayFreshInstall').orElse('false').get()
+if (!(cpayFreshInstallValue in ['true', 'false'])) {
+    throw new GradleException('cpayFreshInstall must be explicitly true or false.')
+}
+def cpayFreshInstall = cpayFreshInstallValue == 'true'
+
 def keystorePropertiesFile = rootProject.file("keystore.properties")
 def keystoreProperties = new Properties()
 if (keystorePropertiesFile.exists()) {
@@ -10,11 +17,15 @@ android {
     namespace = "technology.cpay.wallet"
     compileSdk = rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "technology.cpay.wallet"
+        applicationId = cpayFreshInstall ? "technology.cpay.wallet.fresh" : "technology.cpay.wallet"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 6
         versionName "1.5"
+        manifestPlaceholders = [
+            cpayAppLabel: cpayFreshInstall ? 'CPay 1.5' : '@string/app_name',
+            cpayActivityLabel: cpayFreshInstall ? 'CPay 1.5' : '@string/title_activity_main'
+        ]
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -24,6 +35,9 @@ android {
     }
     signingConfigs {
         release {
+            if (cpayFreshInstall) {
+                storeType "pkcs12"
+            }
             if (keystorePropertiesFile.exists()) {
                 storeFile file(keystoreProperties['storeFile'])
                 storePassword keystoreProperties['storePassword']
