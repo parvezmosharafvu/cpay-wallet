@@ -4,6 +4,8 @@ import {
   FRESH_TAG,
   RELEASE_ASSETS,
   publicationDecision,
+  matchingRelease,
+  readRelease,
   remoteRefs,
   releaseResponse,
   assertFreshMetadata,
@@ -136,4 +138,79 @@ test("remote APK, checksum and provenance bytes must all match before draft beco
     delete missing[name];
     assert.throws(() => assertAssetDigests(expected, missing));
   }
+});
+
+test("authenticated release-list JSON accepts arrays and inaccessible collections fail closed", () => {
+  const body = [draft, { id: 7, tag_name: "v1.4", draft: false }];
+  assert.deepEqual(
+    releaseResponse(
+      `HTTP/2.0 200 OK\nContent-Type: application/json\n\n${JSON.stringify(body)}`,
+      0,
+    ),
+    body,
+  );
+  assert.throws(() => readRelease("owner/repo", () => null), /inaccessible/);
+  assert.throws(() => readRelease("owner/repo", () => ({ message: "Not Found" })), /invalid/);
+});
+
+test("release selection finds matching drafts across pages, ignores prior public releases and rejects duplicates", () => {
+  const previous = { id: 1, tag_name: "v1.4", draft: false };
+  assert.equal(matchingRelease([[previous], [draft]]), draft);
+  assert.equal(matchingRelease([[previous], []]), null);
+  assert.throws(() => matchingRelease([[draft], [{ ...draft, id: 99 }]]), /Multiple releases/);
+  assert.throws(() => matchingRelease([[{ ...draft, id: "42" }]]), /numeric identity/);
+});
+
+test("actual readRelease wiring paginates authenticated lists then reads the draft by numeric ID", () => {
+  const calls = [];
+  const previous = Array.from({ length: 100 }, (_, i) => ({
+    id: i + 100,
+    tag_name: `v0.${i}`,
+    draft: false,
+  }));
+  const result = readRelease("owner/repo", (endpoint) => {
+    calls.push(endpoint);
+    if (endpoint === "repos/owner/repo/releases?per_page=100&page=1") return previous;
+    if (endpoint === "repos/owner/repo/releases?per_page=100&page=2") return [draft];
+    if (endpoint === "repos/owner/repo/releases/42") return { ...draft, assets: [] };
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  });
+  assert.deepEqual(result, { ...draft, assets: [] });
+  assert.deepEqual(calls, [
+    "repos/owner/repo/releases?per_page=100&page=1",
+    "repos/owner/repo/releases?per_page=100&page=2",
+    "repos/owner/repo/releases/42",
+  ]);
+  assert.equal(
+    calls.some((endpoint) => endpoint.includes("/tags/")),
+    false,
+  );
+});
+
+test("readRelease returns absence only after all list pages and rejects an inaccessible draft snapshot", () => {
+  const previous = Array.from({ length: 100 }, (_, i) => ({
+    id: i + 100,
+    tag_name: `old-${i}`,
+    draft: false,
+  }));
+  const calls = [];
+  assert.equal(
+    readRelease("owner/repo", (endpoint) => {
+      calls.push(endpoint);
+      return endpoint.endsWith("page=1") ? previous : [];
+    }),
+    null,
+  );
+  assert.equal(calls.length, 2);
+  assert.throws(
+    () => readRelease("owner/repo", (endpoint) => (endpoint.includes("?") ? [draft] : null)),
+    /disappeared/,
+  );
+  assert.throws(
+    () =>
+      readRelease("owner/repo", (endpoint) =>
+        endpoint.includes("?") ? [draft] : { ...draft, id: 99 },
+      ),
+    /changed identity/,
+  );
 });

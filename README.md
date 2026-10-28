@@ -2,6 +2,12 @@
 
 Self-custody Bitcoin wallet with separate live Breez/Spark and practice wallets, English/Bengali interfaces, PWA, Android and iOS projects.
 
+## Android APK
+
+[Download CPay 1.5](https://github.com/parvezmosharafvu/cpay-wallet/releases/download/v1.5.0-android-fresh/CPay-1.5.apk) or open the [release notes](https://github.com/parvezmosharafvu/cpay-wallet/releases/tag/v1.5.0-android-fresh).
+
+This signed app appears as **CPay 1.5** beside the old CPay app. It uses a separate package and signing key, so it does not replace CPay 1.4 or automatically import its wallet data. Keep the old app until recovery is verified. See [Android build and release instructions](docs/android-release.md).
+
 ## Run and verify
 
 Use Node 22 and npm 10.9.9.

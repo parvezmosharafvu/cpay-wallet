@@ -48,7 +48,7 @@ export function remoteRefs(output) {
   return { mainSha: refs.get("refs/heads/main") ?? null, tagSha: peeled ?? direct };
 }
 
-/** Only an actual HTTP 404 means absence; authentication, transport and server errors fail closed. */
+/** Parse authenticated API JSON. Callers must reject a 404 where an accessible collection/id is required. */
 export function releaseResponse(output, exitCode) {
   const responses = [...output.matchAll(/^HTTP\/\S+\s+(\d{3})[^\r\n]*\r?\n/gm)];
   const response = responses.at(-1);
@@ -65,7 +65,7 @@ export function releaseResponse(output, exitCode) {
   if (!boundary) throw new Error("GitHub release lookup returned incomplete headers.");
   const body = output.slice(headerStart + boundary.index + boundary[0].length);
   const release = JSON.parse(body);
-  if (!release || typeof release !== "object" || Array.isArray(release))
+  if (!release || typeof release !== "object")
     throw new Error("GitHub release response is invalid.");
   return release;
 }
@@ -101,14 +101,60 @@ function run(command, args) {
     maxBuffer: 16 * 1024 * 1024,
   });
 }
-function readRelease(repo) {
-  const result = spawnSync("gh", ["api", "--include", `repos/${repo}/releases/tags/${FRESH_TAG}`], {
+function requestReleaseJson(endpoint) {
+  const result = spawnSync("gh", ["api", "--include", endpoint], {
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
   });
   if (result.error) throw result.error;
   return releaseResponse(result.stdout ?? "", result.status);
 }
+
+export function matchingRelease(pages) {
+  const matches = [];
+  for (const page of pages) {
+    if (!Array.isArray(page))
+      throw new Error("GitHub release listing is inaccessible or invalid; do not assume absence.");
+    for (const release of page) {
+      if (!release || typeof release !== "object" || Array.isArray(release))
+        throw new Error("GitHub release listing contains an invalid record.");
+      if (release.tag_name === FRESH_TAG) matches.push(release);
+    }
+  }
+  if (matches.length > 1)
+    throw new Error("Multiple releases use the fresh tag; inspect the ambiguous drafts manually.");
+  const release = matches[0] ?? null;
+  if (release && (!Number.isSafeInteger(release.id) || release.id <= 0))
+    throw new Error("The listed release has no valid numeric identity.");
+  return release;
+}
+
+/** The by-tag REST endpoint omits drafts. Authenticated listing discovers them; numeric IDs read snapshots. */
+export function readRelease(repo, request = requestReleaseJson) {
+  const pages = [];
+  for (let page = 1; ; page++) {
+    const rows = request(`repos/${repo}/releases?per_page=100&page=${page}`);
+    if (!Array.isArray(rows))
+      throw new Error("GitHub release listing is inaccessible or invalid; do not assume absence.");
+    pages.push(rows);
+    if (rows.length < 100) break;
+  }
+  const listed = matchingRelease(pages);
+  if (!listed) return null;
+  const snapshot = request(`repos/${repo}/releases/${listed.id}`);
+  if (
+    !snapshot ||
+    Array.isArray(snapshot) ||
+    snapshot.id !== listed.id ||
+    snapshot.tag_name !== FRESH_TAG
+  ) {
+    throw new Error(
+      "The discovered release disappeared or changed identity; inspect it before retrying.",
+    );
+  }
+  return snapshot;
+}
+
 function currentRemote() {
   return remoteRefs(
     run("git", [
