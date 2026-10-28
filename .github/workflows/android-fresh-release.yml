@@ -1,0 +1,154 @@
+name: Android fresh install
+
+on:
+  push:
+    branches: [main, build/fresh-signed-apk]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish signed CPay 1.5 as a separate install beside the old wallet
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CPAY_FRESH_INSTALL: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+          cache-dependency-path: |
+            android/**/*.gradle
+            android/gradle/wrapper/gradle-wrapper.properties
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - name: Build current mobile assets
+        env:
+          VITE_AUTH_ENABLED: "false"
+          VITE_GROK_EXTENSIONS: "0"
+          VITE_BREEZ_API_KEY: ${{ secrets.VITE_BREEZ_API_KEY }}
+        run: npm run build:mobile
+      - name: Sync fresh Capacitor app identity
+        run: node node_modules/@capacitor/cli/bin/capacitor sync android
+      - name: Install Android SDK 36 tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+          log-accepted-android-sdk-licenses: false
+      - name: Prepare persistent fresh-install signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.FRESH_ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FRESH_ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FRESH_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FRESH_ANDROID_KEY_PASSWORD }}
+          PUBLISH: "true"
+        run: node scripts/prepare-android-signing.mjs
+      - name: Compile signed fresh-install APK
+        working-directory: android
+        run: ./gradlew --no-daemon assembleRelease
+      - name: Verify signature, separate package and current code
+        env:
+          APK_SIGNED: "true"
+        run: |
+          mkdir -p apk-output
+          cp android/app/build/outputs/apk/release/app-release.apk apk-output/CPay-1.5.apk
+          node scripts/verify-android-apk.mjs apk-output/CPay-1.5.apk --fresh
+          (cd apk-output && sha256sum *.apk > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: CPay-1.5-fresh-signed
+          path: apk-output/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Remove private signing material from runner
+        if: always()
+        run: rm -f android/keystore.properties "$RUNNER_TEMP/cpay-release.jks"
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: CPay-1.5-fresh-signed
+          path: apk-output
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Enable Android emulator hardware acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install beside original CPay and verify startup
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: bash scripts/android-install-smoke.sh apk-output/CPay-1.5.apk
+      - name: Save installation and render evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: CPay-1.5-install-evidence
+          path: smoke-output/
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: [build, smoke]
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: cpay-android-release-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v8
+        with:
+          name: CPay-1.5-fresh-signed
+          path: apk-output
+      - name: Publish verified fresh-install APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          report=json.load(open('apk-output/apk-metadata.json'))
+          policy=json.load(open('android/fresh-release.json'))
+          assert report['signed'] is True and report['installable'] is True
+          assert report['installation'] == 'fresh' and report['installableUpdate'] is False
+          assert report['sourceCommit'] == os.environ['GITHUB_SHA']
+          assert report['signerSha256'] == policy['signerSha256']
+          assert all(report[key] == policy[key] for key in ['package','versionCode','versionName'])
+          PY
+          (cd apk-output && sha256sum --check SHA256SUMS.txt)
+          node scripts/publish-android-fresh.mjs

@@ -1,5 +1,22 @@
 apply plugin: 'com.android.application'
 
+// A new signing identity must be a separate install, never an update to an existing wallet.
+def cpayFreshInstallProperty = providers.gradleProperty('cpayFreshInstall').getOrNull()
+def cpayFreshInstallEnvironment = providers.environmentVariable('CPAY_FRESH_INSTALL').orElse('false').get()
+if (cpayFreshInstallProperty != null && !(cpayFreshInstallProperty in ['true', 'false'])) {
+    throw new GradleException('cpayFreshInstall must be explicitly true or false.')
+}
+if (!(cpayFreshInstallEnvironment in ['true', 'false'])) {
+    throw new GradleException('CPAY_FRESH_INSTALL must be explicitly true or false.')
+}
+if (cpayFreshInstallProperty != null &&
+        cpayFreshInstallProperty != cpayFreshInstallEnvironment) {
+    throw new GradleException('cpayFreshInstall conflicts with CPAY_FRESH_INSTALL; use the same installation mode for Capacitor and Gradle.')
+}
+// The environment is shared with Capacitor; an optional -P can only confirm it, not override it.
+def cpayFreshInstallValue = cpayFreshInstallEnvironment
+def cpayFreshInstall = cpayFreshInstallValue == 'true'
+
 def keystorePropertiesFile = rootProject.file("keystore.properties")
 def keystoreProperties = new Properties()
 if (keystorePropertiesFile.exists()) {
@@ -10,11 +27,15 @@ android {
     namespace = "technology.cpay.wallet"
     compileSdk = rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "technology.cpay.wallet"
+        applicationId = cpayFreshInstall ? "technology.cpay.wallet.fresh" : "technology.cpay.wallet"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 6
         versionName "1.5"
+        manifestPlaceholders = [
+            cpayAppLabel: cpayFreshInstall ? 'CPay 1.5' : '@string/app_name',
+            cpayActivityLabel: cpayFreshInstall ? 'CPay 1.5' : '@string/title_activity_main'
+        ]
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -24,6 +45,9 @@ android {
     }
     signingConfigs {
         release {
+            if (cpayFreshInstall) {
+                storeType "pkcs12"
+            }
             if (keystorePropertiesFile.exists()) {
                 storeFile file(keystoreProperties['storeFile'])
                 storePassword keystoreProperties['storePassword']
