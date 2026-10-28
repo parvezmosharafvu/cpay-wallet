@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   FRESH_TAG,
+  run,
   RELEASE_ASSETS,
   publicationDecision,
   matchingRelease,
   readRelease,
+  readReleaseById,
+  createDraft,
+  prepareDraft,
   remoteRefs,
   releaseResponse,
   assertFreshMetadata,
@@ -16,6 +20,14 @@ const sha = "a".repeat(40);
 const other = "b".repeat(40);
 const draft = { id: 42, tag_name: FRESH_TAG, draft: true, target_commitish: sha };
 const state = { sourceSha: sha, mainSha: sha };
+
+test("the actual command runner pipes a draft JSON payload to stdin", () => {
+  const input = JSON.stringify({ tag_name: FRESH_TAG, draft: true });
+  assert.equal(
+    run(process.execPath, ["-e", "process.stdin.pipe(process.stdout)"], { input }),
+    input,
+  );
+});
 
 test("fresh publication creates only when no release exists and main matches", () => {
   assert.equal(publicationDecision(state), "create-draft");
@@ -212,5 +224,90 @@ test("readRelease returns absence only after all list pages and rejects an inacc
         endpoint.includes("?") ? [draft] : { ...draft, id: 99 },
       ),
     /changed identity/,
+  );
+});
+
+test("draft creation captures POST201 identity and sends an exact JSON draft payload via stdin", () => {
+  const commands = [];
+  const result = createDraft("owner/repo", sha, "release notes", (command, args, options) => {
+    commands.push({ command, args, options });
+    return `HTTP/2.0 201 Created\nContent-Type: application/json\n\n${JSON.stringify(draft)}`;
+  });
+  assert.deepEqual(result, draft);
+  assert.deepEqual(commands[0].args, [
+    "api",
+    "--include",
+    "--method",
+    "POST",
+    "repos/owner/repo/releases",
+    "--input",
+    "-",
+  ]);
+  assert.equal(commands[0].command, "gh");
+  assert.deepEqual(JSON.parse(commands[0].options.input), {
+    tag_name: FRESH_TAG,
+    target_commitish: sha,
+    name: "CPay 1.5 — new install",
+    body: "release notes",
+    draft: true,
+    prerelease: false,
+  });
+});
+
+test("successful draft creation confirms by returned ID even when listing visibility remains delayed", () => {
+  const endpoints = [];
+  let creates = 0;
+  const request = (endpoint) => {
+    endpoints.push(endpoint);
+    if (endpoint.includes("?")) return []; // A new draft is still absent from the listing.
+    if (endpoint === "repos/owner/repo/releases/42") return draft;
+    throw Error(`Unexpected endpoint: ${endpoint}`);
+  };
+  const result = prepareDraft("owner/repo", sha, {
+    request,
+    remote: () => ({ mainSha: sha, tagSha: null }),
+    notes: "notes",
+    command: () => {
+      creates++;
+      return `HTTP/2.0 201 Created\nContent-Type: application/json\n\n${JSON.stringify(draft)}`;
+    },
+  });
+  assert.deepEqual(result, draft);
+  assert.equal(creates, 1);
+  assert.deepEqual(endpoints, [
+    "repos/owner/repo/releases?per_page=100&page=1",
+    "repos/owner/repo/releases/42",
+  ]);
+  endpoints.length = 0;
+  assert.deepEqual(readReleaseById("owner/repo", 42, request), draft);
+  assert.deepEqual(endpoints, ["repos/owner/repo/releases/42"]);
+});
+
+test("an uncertain POST is never repeated and only a matching observed draft can be recovered", () => {
+  let lists = 0,
+    creates = 0;
+  const result = prepareDraft("owner/repo", sha, {
+    request: (endpoint) => (endpoint.includes("?") ? (++lists === 1 ? [] : [draft]) : draft),
+    remote: () => ({ mainSha: sha, tagSha: null }),
+    notes: "notes",
+    command: () => {
+      creates++;
+      throw Error("connection closed after POST");
+    },
+  });
+  assert.deepEqual(result, draft);
+  assert.equal(creates, 1);
+  assert.equal(lists, 2);
+  assert.throws(
+    () =>
+      prepareDraft("owner/repo", sha, {
+        request: () => [],
+        remote: () => ({ mainSha: sha, tagSha: null }),
+        notes: "notes",
+        command: () => {
+          throw Error("uncertain POST");
+        },
+      }),
+    /uncertain POST/,
   );
 });

@@ -49,7 +49,7 @@ export function remoteRefs(output) {
 }
 
 /** Parse authenticated API JSON. Callers must reject a 404 where an accessible collection/id is required. */
-export function releaseResponse(output, exitCode) {
+export function releaseResponse(output, exitCode, expectedStatus = 200) {
   const responses = [...output.matchAll(/^HTTP\/\S+\s+(\d{3})[^\r\n]*\r?\n/gm)];
   const response = responses.at(-1);
   if (!response)
@@ -58,7 +58,7 @@ export function releaseResponse(output, exitCode) {
     );
   const status = Number(response[1]);
   if (status === 404) return null;
-  if (status !== 200 || exitCode !== 0)
+  if (status !== expectedStatus || exitCode !== 0)
     throw new Error(`GitHub release lookup failed (HTTP ${status}).`);
   const headerStart = response.index + response[0].length;
   const boundary = /\r?\n\r?\n/.exec(output.slice(headerStart));
@@ -94,11 +94,12 @@ export function assertAssetDigests(expected, downloaded) {
   }
 }
 
-function run(command, args) {
+export function run(command, args, options = {}) {
   return execFileSync(command, args, {
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     maxBuffer: 16 * 1024 * 1024,
+    ...options,
   });
 }
 function requestReleaseJson(endpoint) {
@@ -141,11 +142,16 @@ export function readRelease(repo, request = requestReleaseJson) {
   }
   const listed = matchingRelease(pages);
   if (!listed) return null;
-  const snapshot = request(`repos/${repo}/releases/${listed.id}`);
+  return readReleaseById(repo, listed.id, request);
+}
+
+export function readReleaseById(repo, id, request = requestReleaseJson) {
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error("A valid release ID is required.");
+  const snapshot = request(`repos/${repo}/releases/${id}`);
   if (
     !snapshot ||
     Array.isArray(snapshot) ||
-    snapshot.id !== listed.id ||
+    snapshot.id !== id ||
     snapshot.tag_name !== FRESH_TAG
   ) {
     throw new Error(
@@ -153,6 +159,57 @@ export function readRelease(repo, request = requestReleaseJson) {
     );
   }
   return snapshot;
+}
+
+export function createDraft(repo, sourceSha, notes, command = run) {
+  const payload = {
+    tag_name: FRESH_TAG,
+    target_commitish: sourceSha,
+    name: "CPay 1.5 — new install",
+    body: notes,
+    draft: true,
+    prerelease: false,
+  };
+  const output = command(
+    "gh",
+    ["api", "--include", "--method", "POST", `repos/${repo}/releases`, "--input", "-"],
+    { input: JSON.stringify(payload) },
+  );
+  const release = releaseResponse(output, 0, 201);
+  if (!release || Array.isArray(release) || !Number.isSafeInteger(release.id) || release.id <= 0)
+    throw new Error("Draft creation returned no valid numeric identity.");
+  return release;
+}
+
+/** A successful create response is authoritative; release-list propagation is not needed to confirm it. */
+export function prepareDraft(
+  repo,
+  sourceSha,
+  {
+    request = requestReleaseJson,
+    command = run,
+    remote = currentRemote,
+    notes = readFileSync("docs/android-fresh-release-notes.md", "utf8"),
+  } = {},
+) {
+  let release = readRelease(repo, request);
+  const decision = publicationDecision({ sourceSha, ...remote(), release });
+  if (decision === "create-draft") {
+    try {
+      release = createDraft(repo, sourceSha, notes, command);
+      publicationDecision({ sourceSha, ...remote(), release });
+    } catch (error) {
+      // Never repeat an uncertain POST. Listing is used only to recover its observed result.
+      const observed = readRelease(repo, request);
+      if (!observed) throw error;
+      publicationDecision({ sourceSha, ...remote(), release: observed });
+      release = observed;
+    }
+  }
+  if (!release) throw new Error("Draft creation was not confirmed; refusing to upload assets.");
+  const confirmed = readReleaseById(repo, release.id, request);
+  publicationDecision({ sourceSha, ...remote(), release: confirmed });
+  return confirmed;
 }
 
 function currentRemote() {
@@ -192,35 +249,7 @@ export function publishFreshRelease(env = process.env) {
   const checksum = readFileSync(join(directory, "SHA256SUMS.txt"), "utf8").trim();
   if (checksum !== `${expected["CPay-1.5.apk"]}  CPay-1.5.apk`)
     throw new Error("APK checksum manifest does not match the verified APK bytes.");
-  let release = readRelease(repo);
-  const decision = publicationDecision({ sourceSha, ...currentRemote(), release });
-  if (decision === "create-draft") {
-    try {
-      run("gh", [
-        "release",
-        "create",
-        FRESH_TAG,
-        "--repo",
-        repo,
-        "--draft",
-        "--target",
-        sourceSha,
-        "--title",
-        "CPay 1.5 — new install",
-        "--notes-file",
-        "docs/android-fresh-release-notes.md",
-      ]);
-    } catch (error) {
-      // A timeout or competing create is uncertain. Inspect the target before attempting any mutation.
-      const observed = readRelease(repo);
-      if (!observed) throw error;
-      publicationDecision({ sourceSha, ...currentRemote(), release: observed });
-      release = observed;
-    }
-  }
-  release = readRelease(repo);
-  publicationDecision({ sourceSha, ...currentRemote(), release });
-  if (!release) throw new Error("Draft creation was not confirmed; refusing to upload assets.");
+  let release = prepareDraft(repo, sourceSha);
   const draftId = release.id;
   // --clobber is permitted only after this matching draft check. Workflow-level publication concurrency is also required.
   run("gh", [
@@ -245,12 +274,12 @@ export function publishFreshRelease(env = process.env) {
   ]);
   assertAssetDigests(expected, assetDigests(downloaded));
   // Recheck the branch, peeled tag and draft after uploads, immediately before making it public/latest.
-  release = readRelease(repo);
+  release = readReleaseById(repo, draftId);
   publicationDecision({ sourceSha, ...currentRemote(), release });
   if (!release || release.id !== draftId)
     throw new Error("The release identity changed during publication.");
   run("gh", ["release", "edit", FRESH_TAG, "--repo", repo, "--draft=false", "--latest"]);
-  const published = readRelease(repo);
+  const published = readReleaseById(repo, draftId);
   if (
     published?.id !== draftId ||
     published.draft !== false ||
